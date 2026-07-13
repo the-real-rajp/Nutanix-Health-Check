@@ -44,13 +44,50 @@ python -m pip install -r requirements.txt
 
 ## Usage
 
-Interactive mode:
+### Recommended: interactive mode
+
+Run the script without arguments:
 
 ```bash
 python nutanix_health_check.py
 ```
 
-Specify Prism Central and the user name while allowing the script to prompt securely for the password:
+The script starts with **Preflight Validation**. Before requesting Prism Central credentials, it confirms that these required support files are available:
+
+- `data/OS_Compatibility_Matrix.csv`
+- `data/NOS_EOL_information_list.csv`
+
+A successful preflight looks similar to:
+
+```text
+------------------------------------------------------------
+Nutanix Health Check - Preflight Validation
+------------------------------------------------------------
+
+Checking required support files...
+
+  [OK] OS_Compatibility_Matrix.csv
+  [OK] NOS_EOL_information_list.csv
+
+All required support files found.
+Proceeding to Prism Central connection...
+```
+
+After validation, the script interactively prompts for:
+
+1. Prism Central IP address or FQDN
+2. API port, with `9440` as the default
+3. Prism Central username
+4. Password, entered through a hidden prompt
+5. Customer or organization name for the report
+
+The script then tests the Prism Central connection, discovers registered clusters, collects each cluster's data, and generates the raw JSON and Word health-check report.
+
+If either CSV is missing, preflight stops before any connection information is requested and lists the expected filename.
+
+### Optional command-line mode
+
+Prism Central, user, customer, and output settings can be supplied as arguments while still allowing the script to prompt securely for the password:
 
 ```bash
 python nutanix_health_check.py \
@@ -61,6 +98,8 @@ python nutanix_health_check.py \
 ```
 
 Avoid supplying `--password` directly when possible because command-line values may be retained in shell history or visible to other processes.
+
+### Generate from saved JSON
 
 Generate a report from an existing raw JSON capture without connecting to Prism Central:
 
@@ -96,4 +135,3 @@ Generated reports, raw captures, temporary report-builder files, Python caches, 
 ## Project status
 
 The project is under active development. Test changes against representative clusters before using a new revision as the reporting baseline.
-
