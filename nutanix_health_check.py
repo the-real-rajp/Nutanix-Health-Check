@@ -57,9 +57,12 @@ def _support_file_candidate_paths(filenames: list, explicit_path: str = "") -> l
     if explicit_path:
         candidates.append(explicit_path)
 
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     search_dirs = [
         os.getcwd(),
-        os.path.dirname(os.path.abspath(__file__)),
+        os.path.join(os.getcwd(), "data"),
+        script_dir,
+        os.path.join(script_dir, "data"),
         "/mnt/data",
     ]
     for folder in search_dirs:
