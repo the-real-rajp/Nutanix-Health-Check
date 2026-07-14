@@ -123,6 +123,13 @@ Depending on the selected mode, the script creates:
 
 - `<cluster>_raw.json`
 - `<cluster>_Health_Check.docx`
+- `logs/Nutanix_Health_Check_YYYY-MM-DD_HH-MM-SS.log`
+
+The preflight creates and validates the `logs` folder inside the selected
+output directory. The timestamped execution log captures preflight results,
+collection progress, warnings, generated file paths, errors, and completion
+time. Its filename avoids characters that are invalid on Windows and is also
+safe to use on macOS.
 
 Generated reports, raw captures, temporary report-builder files, Python caches, and local Node.js packages are excluded by `.gitignore`.
 

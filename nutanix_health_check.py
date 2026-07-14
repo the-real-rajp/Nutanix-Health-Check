@@ -21,6 +21,7 @@ Requirements:
 """
 
 import argparse
+import atexit
 import csv
 import getpass
 import json
@@ -4209,8 +4210,8 @@ const D = DATA;
 const C = D.cluster;
 
 const summaryStatuses = [
-  ["Virtual Machines Summary",     D.vms.status],
   ["Alerts Summary",               D.health.status],
+  ["Virtual Machines Summary",     D.vms.status],
   ["Protection Domain Summary",    D.protection.status],
   ["Cluster CPU Summary",  D.cpu.status],
   ["Cluster Memory Summary", D.memory.status],
@@ -5347,6 +5348,18 @@ const children = [
   pageBreak(),
 
 
+  // ALERTS
+  heading1("Alerts Summary"),
+  alertOverviewTable(),
+  heading2("Alert Severity Summary"),
+  alertSeveritySummaryTable(),
+  heading2("Recommended Actions"),
+  body("The following action list consolidates active alerts into an operational checklist."),
+  recommendedActionsTable(),
+  heading2("Active Alert Details"),
+  alertTable(),
+  pageBreak(),
+
   // VMs
   heading1("Virtual Machines Summary"),
   sectionTable("Virtual Machines", D.vms.status,
@@ -5363,18 +5376,6 @@ const children = [
   ngtSummaryTable(),
   ...vmDetailTable(),
   ...cvmTable(),
-  pageBreak(),
-
-  // ALERTS
-  heading1("Alerts Summary"),
-  alertOverviewTable(),
-  heading2("Alert Severity Summary"),
-  alertSeveritySummaryTable(),
-  heading2("Active Alert Details"),
-  alertTable(),
-  heading2("Recommended Actions"),
-  body("The following action list consolidates active alerts into an operational checklist."),
-  recommendedActionsTable(),
   pageBreak(),
 
   // PROTECTION
@@ -5761,6 +5762,67 @@ def safe_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
 
+class _TeeStream:
+    """Write console output to both the terminal and the execution log."""
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, text):
+        self.terminal.write(text)
+        self.log_file.write(text)
+        return len(text)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+    @property
+    def encoding(self):
+        return getattr(self.terminal, "encoding", "utf-8")
+
+
+def start_execution_log(output_dir: str) -> str:
+    """Capture console output in an output-dir/logs timestamped log file."""
+    output_dir = os.path.abspath(output_dir or ".")
+    log_dir = os.path.join(output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base_name = f"Nutanix_Health_Check_{timestamp}"
+    log_path = os.path.join(log_dir, f"{base_name}.log")
+    sequence = 1
+    while os.path.exists(log_path):
+        log_path = os.path.join(log_dir, f"{base_name}_{sequence:02d}.log")
+        sequence += 1
+
+    log_file = open(log_path, "x", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = _TeeStream(original_stdout, log_file)
+    sys.stderr = _TeeStream(original_stderr, log_file)
+
+    def close_execution_log():
+        finished = datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            log_file.write(f"\nExecution finished: {finished}\n")
+            log_file.flush()
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_file.close()
+
+    atexit.register(close_execution_log)
+    started = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"Execution started: {started}")
+    print(f"Execution log: {log_path}")
+    return log_path
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -5784,13 +5846,27 @@ def parse_args() -> argparse.Namespace:
 
 def preflight_required_support_files(args: argparse.Namespace) -> None:
     """Validate required CSV support files before prompting for Prism Central details."""
-    if getattr(args, "data_only", False):
-        return
-
     print()
     print("------------------------------------------------------------")
     print("Nutanix Health Check - Preflight Validation")
     print("------------------------------------------------------------")
+    print()
+    print("Checking output directories...")
+    print()
+
+    log_dir = os.path.abspath(os.path.join(args.output_dir or ".", "logs"))
+    if os.path.isdir(log_dir) and os.access(log_dir, os.W_OK):
+        print(f"  [OK] Logs directory: {log_dir}")
+    else:
+        print(f"  [ERROR] Logs directory is missing or not writable: {log_dir}")
+        print()
+        sys.exit(1)
+
+    if getattr(args, "data_only", False):
+        print()
+        print("Support-file validation skipped in data-only mode.")
+        return
+
     print()
     print("Checking required support files...")
     print()
@@ -5830,6 +5906,7 @@ def preflight_required_support_files(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    start_execution_log(args.output_dir)
 
     # Validate required CSV files before prompting for Prism Central details.
     preflight_required_support_files(args)
