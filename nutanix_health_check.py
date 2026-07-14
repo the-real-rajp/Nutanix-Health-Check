@@ -512,6 +512,7 @@ class ClusterDataCollector:
         cid = self.cluster_ext_id
         steps = [
             ("cluster_info",        self._cluster_info),
+            ("security_hardening",  self._security_hardening),
             ("storage_containers",  self._storage_containers),  # collect early to detect API ver
             ("container_stats",     self._container_stats),     # per-container detail stats
             ("nodes",               self._nodes),
@@ -560,6 +561,52 @@ class ClusterDataCollector:
             except Exception:
                 continue
         return {}
+
+    def _security_hardening(self):
+        """Collect cluster security-hardening state from PC and PE.
+
+        The PC Security Summary API exposes the dashboard-level controls such
+        as cluster lockdown, log forwarding, consent banner, and host Secure
+        Boot.  PE v2 cluster inventory supplies the CVM/AHV consent-banner
+        settings when they are available.
+        Both sources are optional because Security Dashboard availability and
+        legacy PE field coverage vary by software version and licensing.
+        """
+        result = {}
+
+        # Security Dashboard API. Try the current version first and retain the
+        # cluster-specific record only.
+        for ver in ["v4.1", "v4.0"]:
+            path = f"/security/{ver}/report/security-summaries"
+            attempts = [
+                {"$filter": f"clusterExtId eq '{self.cluster_ext_id}'", "$limit": 100},
+                {"$limit": 100},
+            ]
+            for params in attempts:
+                try:
+                    response = self.client.get(path, params)
+                    records = response.get("data", []) if isinstance(response, dict) else []
+                    if isinstance(records, dict):
+                        records = [records]
+                    match = next(
+                        (r for r in records if isinstance(r, dict) and r.get("clusterExtId") == self.cluster_ext_id),
+                        None,
+                    )
+                    if match:
+                        result["pc_security_summary"] = match
+                        break
+                except Exception:
+                    continue
+            if result.get("pc_security_summary"):
+                break
+
+        # PE v2 returns security_compliance_config and
+        # hypervisor_security_compliance_config on the cluster object.
+        pe_cluster = self._pe_v2_get("/cluster/") or self._pe_v2_get("/cluster")
+        if isinstance(pe_cluster, dict) and pe_cluster:
+            result["pe_cluster"] = pe_cluster
+
+        return result
 
     def _nodes(self):
         """Fetch hosts/host-nodes using all known API version + path patterns."""
@@ -3584,24 +3631,131 @@ class HealthAnalyser:
         c = self._cluster_first()
         config = c.get("config", {}) if isinstance(c, dict) else {}
 
+        hardening_raw = self.raw.get("security_hardening") or {}
+        if not isinstance(hardening_raw, dict):
+            hardening_raw = {}
+        pc_security = hardening_raw.get("pc_security_summary") or {}
+        pc_config_summary = pc_security.get("securityConfigSummary") or {}
+        pe_cluster = hardening_raw.get("pe_cluster") or {}
+        if isinstance(pe_cluster, dict) and isinstance(pe_cluster.get("data"), dict):
+            pe_cluster = pe_cluster["data"]
+        if not isinstance(pe_cluster, dict):
+            pe_cluster = {}
+        cvm_security = pe_cluster.get("security_compliance_config") or {}
+        ahv_security = pe_cluster.get("hypervisor_security_compliance_config") or {}
+
+        def _first_known(*values):
+            return next((value for value in values if value is not None), None)
+
+        def _combined_bool(*values):
+            known = [value for value in values if isinstance(value, bool)]
+            return (all(known) if known else None)
+
+        def _bool_text(value):
+            return "Enabled" if value is True else ("Disabled" if value is False else "N/A")
+
+        def _hardening_status(value):
+            if value is None:
+                return "N/A"
+            return self.STATUS_HEALTHY if value is True else self.STATUS_RECOMMENDED
+
+        def _hardware_generation(node):
+            """Return the Nutanix platform generation encoded in the model."""
+            if not isinstance(node, dict):
+                return None
+            model_values = [
+                node.get("blockModel"),
+                node.get("block_model"),
+                node.get("model"),
+                node.get("hardwareModel"),
+                node.get("hardware_model"),
+            ]
+            for model_value in model_values:
+                if not model_value:
+                    continue
+                match = re.search(r"(?:^|[^A-Z0-9])G(?:EN)?[-_ ]?(\d+)(?:$|[^0-9])", str(model_value), re.IGNORECASE)
+                if match:
+                    return int(match.group(1))
+            return None
+
+        def _node_model(node):
+            if not isinstance(node, dict):
+                return "N/A"
+            return str(
+                node.get("blockModel")
+                or node.get("block_model")
+                or node.get("model")
+                or node.get("hardwareModel")
+                or node.get("hardware_model")
+                or "N/A"
+            )
+
         password_remote_login = config.get("isPasswordRemoteLoginEnabled")
         remote_support = config.get("isRemoteSupportEnabled")
         pulse_enabled = (config.get("pulseStatus") or {}).get("isEnabled")
-        authorized_keys = config.get("authorizedPublicKeyList")
-        ssh_key_count = len(authorized_keys) if isinstance(authorized_keys, list) else None
-
         nodes = self._safe_list("nodes")
         secure_boot_values = [n.get("isSecureBooted") for n in nodes if isinstance(n, dict) and n.get("isSecureBooted") is not None]
-        secure_boot_enabled = bool(secure_boot_values) and all(bool(v) for v in secure_boot_values)
-        secure_boot_text = "Enabled on all hosts" if secure_boot_enabled else ("Disabled on one or more hosts" if secure_boot_values else "N/A")
-        secure_boot_enabled_count = sum(1 for v in secure_boot_values if bool(v))
+        secure_boot_eligible_nodes = [
+            n for n in nodes
+            if isinstance(n, dict) and (_hardware_generation(n) is None or _hardware_generation(n) >= 8)
+        ]
+        secure_boot_eligible_values = [
+            n.get("isSecureBooted") for n in secure_boot_eligible_nodes
+            if n.get("isSecureBooted") is not None
+        ]
+        pre_g8_nodes = [
+            n for n in nodes
+            if isinstance(n, dict) and _hardware_generation(n) is not None and _hardware_generation(n) < 8
+        ]
+        secure_boot_enabled = bool(secure_boot_eligible_values) and all(bool(v) for v in secure_boot_eligible_values)
+        if secure_boot_eligible_values:
+            secure_boot_text = "Enabled on all supported hosts" if secure_boot_enabled else "Disabled on one or more supported hosts"
+            secure_boot_status = self.STATUS_HEALTHY if secure_boot_enabled else self.STATUS_RECOMMENDED
+        elif pre_g8_nodes and len(pre_g8_nodes) == len(nodes):
+            secure_boot_text = "Not supported on pre-G8 platforms"
+            secure_boot_status = self.STATUS_HEALTHY
+        else:
+            secure_boot_text = "N/A"
+            secure_boot_status = "N/A"
+        secure_boot_enabled_count = sum(1 for v in secure_boot_eligible_values if bool(v))
+
+        pc_full_config = pc_security.get("securityConfig") or pc_security.get("securityConfiguration") or {}
+        if not isinstance(pc_full_config, dict):
+            pc_full_config = {}
+        cluster_lockdown = _first_known(
+            pc_config_summary.get("isClusterLockdownEnabled"),
+            pe_cluster.get("enable_lock_down"),
+            pe_cluster.get("enableLockDown"),
+        )
+        log_forwarding = pc_config_summary.get("isLogForwardingEnabled")
+        defense_banner = _first_known(
+            pc_config_summary.get("isConsentBannerEnabled"),
+            pc_full_config.get("isClusterDefenseConsentBannerEnabled"),
+            pc_full_config.get("isAhvDefenseConsentBannerEnabled"),
+            _combined_bool(
+                cvm_security.get("enable_banner"),
+                ahv_security.get("enable_banner"),
+            ),
+        )
+        network_segmentation = (
+            ((c.get("network") or {}).get("backplane") or {}).get("isSegmentationEnabled")
+            if isinstance(c, dict) else None
+        )
         host_secure_boot = []
         for node in sorted(nodes, key=lambda n: str(n.get("hostName") or n.get("name") or n.get("extId") or "").lower()):
             value = node.get("isSecureBooted") if isinstance(node, dict) else None
+            generation = _hardware_generation(node)
+            if generation is not None and generation < 8:
+                boot_value = "Not supported (pre-G8)"
+                boot_status = self.STATUS_HEALTHY
+            else:
+                boot_value = "Enabled" if value is True else ("Disabled" if value is False else "N/A")
+                boot_status = self.STATUS_HEALTHY if value is True else (self.STATUS_RECOMMENDED if value is False else "N/A")
             host_secure_boot.append({
                 "host": node.get("hostName") or node.get("name") or node.get("extId") or "Unknown",
-                "secure_boot": "Enabled" if value is True else ("Disabled" if value is False else "N/A"),
-                "status": self.STATUS_HEALTHY if value is True else (self.STATUS_RECOMMENDED if value is False else "N/A"),
+                "model": _node_model(node),
+                "secure_boot": boot_value,
+                "status": boot_status,
             })
 
         containers = self._safe_list("storage_containers")
@@ -3631,25 +3785,40 @@ class HealthAnalyser:
         recs = []
         status = self.STATUS_HEALTHY
 
+        if remote_support is True:
+            status = self.STATUS_CRITICAL
+            findings.append("Remote Support is enabled")
+            recs.append("Disable Remote Support when it is not actively required by Nutanix Support.")
+
+        if cluster_lockdown is False:
+            if status == self.STATUS_HEALTHY:
+                status = self.STATUS_RECOMMENDED
+            findings.append("Cluster Lockdown is disabled")
+            recs.append("Enable Cluster Lockdown after validating key-based SSH access and operational access requirements.")
+
         if password_remote_login is True:
-            status = self.STATUS_RECOMMENDED
+            if status == self.STATUS_HEALTHY:
+                status = self.STATUS_RECOMMENDED
             findings.append("Password-based remote login is enabled")
             recs.append("Disable password-based remote login where operationally appropriate and use key-based SSH access.")
 
-        if secure_boot_values and not secure_boot_enabled:
-            status = self.STATUS_RECOMMENDED
-            findings.append("Secure Boot is disabled on one or more hosts")
-            recs.append("Review Secure Boot requirements and enable it during a supported maintenance procedure where appropriate.")
+        if secure_boot_eligible_values and not secure_boot_enabled:
+            if status == self.STATUS_HEALTHY:
+                status = self.STATUS_RECOMMENDED
+            findings.append("Secure Boot is disabled on one or more G8-or-newer/eligible hosts")
+            recs.append("Enable Host Secure Boot on supported G8-or-newer platforms during an approved maintenance procedure.")
 
         if encryption.get("status") == "Disabled":
-            status = self.STATUS_RECOMMENDED
+            if status == self.STATUS_HEALTHY:
+                status = self.STATUS_RECOMMENDED
             findings.append("Storage software encryption is disabled")
             recs.append("Review data-at-rest encryption requirements and enable Nutanix software encryption where required by policy.")
 
         if pulse_enabled is False:
-            status = self.STATUS_RECOMMENDED
+            if status == self.STATUS_HEALTHY:
+                status = self.STATUS_RECOMMENDED
             findings.append("Pulse is disabled")
-            recs.append("Review whether Pulse should be enabled for proactive support telemetry.")
+            recs.append("Enable Pulse to provide proactive support telemetry, subject to the organization's data-sharing policy.")
 
         alert_text = " ".join(self._alert_text(a) for a in security_alerts)
         if "default password" in alert_text:
@@ -3666,11 +3835,6 @@ class HealthAnalyser:
         if not recs:
             recs.append("No immediate security configuration changes are recommended based on the collected Prism Central data.")
 
-        recs.append(
-            "Review Nutanix STIG guidance when applicable: "
-            "https://portal.nutanix.com/page/documents/kbs/details?targetId=kA07V000000LZCQSA4"
-        )
-
         # Preserve recommendation order while removing duplicate guidance.
         recs = list(dict.fromkeys(recs))
 
@@ -3686,14 +3850,9 @@ class HealthAnalyser:
                 "status": _setting_status(password_remote_login, False),
             },
             {
-                "item": "Authorized SSH Keys",
-                "value": f"{ssh_key_count} configured" if ssh_key_count is not None else "N/A",
-                "status": (self.STATUS_HEALTHY if ssh_key_count and ssh_key_count > 0 else (self.STATUS_RECOMMENDED if ssh_key_count == 0 else "N/A")),
-            },
-            {
                 "item": "Remote Support",
                 "value": "Enabled" if remote_support is True else ("Disabled" if remote_support is False else "N/A"),
-                "status": "N/A",
+                "status": (self.STATUS_CRITICAL if remote_support is True else (self.STATUS_HEALTHY if remote_support is False else "N/A")),
             },
             {
                 "item": "Pulse",
@@ -3701,19 +3860,37 @@ class HealthAnalyser:
                 "status": _setting_status(pulse_enabled, True),
             },
             {
-                "item": "Secure Boot",
-                "value": secure_boot_text,
-                "status": (self.STATUS_HEALTHY if secure_boot_enabled else (self.STATUS_RECOMMENDED if secure_boot_values else "N/A")),
-            },
-            {
                 "item": "Data-at-Rest Encryption",
                 "value": encryption.get("status", "N/A"),
                 "status": (self.STATUS_HEALTHY if encryption.get("status") == "Enabled" else self.STATUS_RECOMMENDED),
             },
+        ]
+
+        security_hardening_items = [
             {
-                "item": "Key Management",
-                "value": encryption.get("key_management", "N/A"),
-                "status": (self.STATUS_HEALTHY if encryption.get("key_management") in {"Internal KMS", "External KMS"} else "N/A"),
+                "item": "Host Secure Boot",
+                "value": secure_boot_text,
+                "status": secure_boot_status,
+            },
+            {
+                "item": "AOS Network Segmentation",
+                "value": _bool_text(network_segmentation),
+                "status": _hardening_status(network_segmentation),
+            },
+            {
+                "item": "Cluster Lockdown",
+                "value": _bool_text(cluster_lockdown),
+                "status": _hardening_status(cluster_lockdown),
+            },
+            {
+                "item": "Log Forwarding",
+                "value": _bool_text(log_forwarding),
+                "status": _hardening_status(log_forwarding),
+            },
+            {
+                "item": "Defense Consent Banner",
+                "value": _bool_text(defense_banner),
+                "status": _hardening_status(defense_banner),
             },
         ]
 
@@ -3729,9 +3906,14 @@ class HealthAnalyser:
             "encryption_type": encryption.get("encryption_type", "N/A"),
             "encrypted_containers": len(encryption.get("encrypted_containers", [])),
             "configuration_items": configuration_items,
+            "security_hardening_items": security_hardening_items,
+            "cluster_lockdown": _bool_text(cluster_lockdown),
+            "log_forwarding": _bool_text(log_forwarding),
+            "network_segmentation": _bool_text(network_segmentation),
             "host_secure_boot": host_secure_boot,
             "secure_boot_enabled_count": secure_boot_enabled_count,
-            "secure_boot_host_count": len(secure_boot_values),
+            "secure_boot_host_count": len(secure_boot_eligible_values),
+            "secure_boot_note": "Secure Boot support begins with Nutanix G8 platforms.",
             "security_alert_count": len(security_alerts),
             "critical_security_alert_count": len(critical_security_alerts),
             "security_alerts": [
@@ -4297,22 +4479,45 @@ function securityConfigurationSummaryTable() {
   });
 }
 
+function securityHardeningSummaryTable() {
+  const items = Array.isArray(D.security.security_hardening_items) ? D.security.security_hardening_items : [];
+  const CW = [4800, 3600, 2400];
+  if (items.length === 0) return body("Security hardening information was not available from the collected Prism APIs.", { italic: true });
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Hardening Control", CW[0]), hdrCell("Value", CW[1]), hdrCell("Status", CW[2])] }),
+      ...items.map((item, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(item.item || "N/A", { width: CW[0], shading: bg, bold: true }),
+          cell(item.value || "N/A", { width: CW[1], shading: bg }),
+          securityStatusCell(item.status, CW[2], bg),
+        ]});
+      }),
+    ],
+  });
+}
+
 function hostSecureBootSummaryTable() {
   const hosts = Array.isArray(D.security.host_secure_boot) ? D.security.host_secure_boot : [];
-  const CW = [6000, 2400, 2400];
+  const CW = [3400, 2800, 2800, 1800];
   if (hosts.length === 0) return body("Host Secure Boot information was not available from the collected Prism Central APIs.", { italic: true });
   return new Table({
     layout: TableLayoutType.AUTOFIT,
     width: { size: CONTENT_WIDTH, type: WidthType.DXA },
     columnWidths: CW,
     rows: [
-      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Host", CW[0]), hdrCell("Secure Boot", CW[1]), hdrCell("Status", CW[2])] }),
+      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Host", CW[0]), hdrCell("Model", CW[1]), hdrCell("Secure Boot", CW[2]), hdrCell("Status", CW[3])] }),
       ...hosts.map((host, i) => {
         const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
         return new TableRow({ cantSplit: true, children: [
           cell(host.host || "N/A", { width: CW[0], shading: bg, bold: true }),
-          cell(host.secure_boot || "N/A", { width: CW[1], shading: bg }),
-          securityStatusCell(host.status, CW[2], bg),
+          cell(host.model || "N/A", { width: CW[1], shading: bg }),
+          cell(host.secure_boot || "N/A", { width: CW[2], shading: bg }),
+          securityStatusCell(host.status, CW[3], bg),
         ]});
       }),
     ],
@@ -5275,7 +5480,10 @@ const children = [
   heading1("Security Summary"),
   sectionTable("Security", D.security.status,
     `• Security Configuration Checks: ${(D.security.configuration_items || []).length}\n` +
-    `• Hosts with Secure Boot Enabled: ${D.security.secure_boot_enabled_count || 0} of ${D.security.secure_boot_host_count || 0}\n` +
+    `• Security Hardening Checks: ${(D.security.security_hardening_items || []).length}\n` +
+    ((D.security.secure_boot_host_count || 0) > 0
+      ? `• Eligible Hosts with Secure Boot Enabled: ${D.security.secure_boot_enabled_count || 0} of ${D.security.secure_boot_host_count}\n`
+      : `• Secure Boot Eligibility: No G8-or-newer hosts detected\n`) +
     `• Data-at-Rest Encryption: ${D.security.storage_encryption || "N/A"}\n` +
     `• Active Security Alerts: ${D.security.security_alert_count || 0}\n` +
     `• Critical Security Alerts: ${D.security.critical_security_alert_count || 0}`,
@@ -5283,7 +5491,11 @@ const children = [
   ...(((D.security.security_alerts || []).length > 0) ? [heading2("Active Security Alerts"), correlatedAlertTable(D.security.security_alerts)] : []),
   heading2("Security Configuration Summary"),
   securityConfigurationSummaryTable(),
+  pageBreak(),
+  heading2("Security Hardening Summary"),
+  securityHardeningSummaryTable(),
   heading2("Host Secure Boot Summary"),
+  body(D.security.secure_boot_note || "Secure Boot support begins with Nutanix G8 platforms.", { italic: true }),
   hostSecureBootSummaryTable(),
   heading2("Data-at-Rest Encryption Summary"),
   encryptionSecuritySummaryTable(),
