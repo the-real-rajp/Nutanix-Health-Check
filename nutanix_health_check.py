@@ -1092,7 +1092,7 @@ class ClusterDataCollector:
         return []
 
     def _recovery_plans(self):
-        """Collect v4 Recovery Plans and their report-friendly subresources."""
+        """Collect Recovery Plans from v4, then fall back to legacy v3."""
         for ver in ["v4.2", "v4.1"]:
             try:
                 response = self.client.get(
@@ -1108,6 +1108,7 @@ class ClusterDataCollector:
                     if not isinstance(plan, dict):
                         continue
                     item = dict(plan)
+                    item["_api_generation"] = "v4"
                     ext_id = item.get("extId")
                     if ext_id:
                         for key, child_path in [
@@ -1124,10 +1125,44 @@ class ClusterDataCollector:
                             except Exception:
                                 item[key] = []
                     enriched.append(item)
-                return enriched
+                if enriched:
+                    return enriched
             except Exception:
                 continue
-        return []
+
+        # Recovery Plans created through the legacy Prism Central v3 API are
+        # not returned by the v4 Data Policies list endpoint. Prism Central's
+        # UI can therefore show plans while the v4 endpoint reports zero.
+        plans = []
+        offset = 0
+        page_length = 100
+        try:
+            while True:
+                response = self.client.post(
+                    "/nutanix/v3/recovery_plans/list",
+                    body={
+                        "kind": "recovery_plan",
+                        "length": page_length,
+                        "offset": offset,
+                    },
+                )
+                page = response.get("entities", []) if isinstance(response, dict) else []
+                if not isinstance(page, list) or not page:
+                    break
+                for plan in page:
+                    if isinstance(plan, dict):
+                        item = dict(plan)
+                        item["_api_generation"] = "v3"
+                        plans.append(item)
+
+                metadata = response.get("metadata", {}) if isinstance(response, dict) else {}
+                total = metadata.get("total_matches")
+                offset += len(page)
+                if len(page) < page_length or (isinstance(total, int) and offset >= total):
+                    break
+        except Exception:
+            return []
+        return plans
 
     def _storage_containers(self):
         """Fetch storage containers; also used early to detect API version."""
@@ -2513,6 +2548,77 @@ class HealthAnalyser:
         for plan in recovery_plans:
             if not isinstance(plan, dict):
                 continue
+
+            if plan.get("_api_generation") == "v3" or (
+                isinstance(plan.get("metadata"), dict)
+                and plan.get("metadata", {}).get("kind") == "recovery_plan"
+            ):
+                status_block = plan.get("status") if isinstance(plan.get("status"), dict) else {}
+                spec_block = plan.get("spec") if isinstance(plan.get("spec"), dict) else {}
+                resources = status_block.get("resources") or spec_block.get("resources") or {}
+                parameters = resources.get("parameters") or {}
+                locations = parameters.get("availability_zone_list") or []
+
+                location_names = []
+                location_ids = []
+                for location in locations:
+                    if not isinstance(location, dict):
+                        location_names.append("N/A")
+                        location_ids.append([])
+                        continue
+                    refs = location.get("cluster_reference_list") or []
+                    names = []
+                    ids = []
+                    for ref in refs:
+                        if not isinstance(ref, dict):
+                            continue
+                        ext_id = str(ref.get("uuid") or ref.get("extId") or "")
+                        if ext_id:
+                            ids.append(ext_id)
+                        names.append(str(ref.get("name") or _cluster_name(ext_id)))
+                    location_names.append(", ".join(value for value in names if value) or "N/A")
+                    location_ids.append(ids)
+
+                referenced_ids = {
+                    ext_id for ids in location_ids for ext_id in ids if ext_id
+                }
+                if cluster_ext_id and referenced_ids and cluster_ext_id not in referenced_ids:
+                    continue
+
+                primary_index = parameters.get("primary_location_index")
+                if not isinstance(primary_index, int) or not 0 <= primary_index < len(location_names):
+                    primary_index = 0 if location_names else -1
+                primary_name = location_names[primary_index] if primary_index >= 0 else "N/A"
+                recovery_names = [
+                    name for index, name in enumerate(location_names)
+                    if index != primary_index and name != "N/A"
+                ]
+
+                mapping_count = 0
+                for mapping in parameters.get("network_mapping_list") or []:
+                    if not isinstance(mapping, dict):
+                        continue
+                    zone_mappings = mapping.get("availability_zone_network_mapping_list") or []
+                    mapping_count += len(zone_mappings) if isinstance(zone_mappings, list) else 0
+
+                plan_state = str(status_block.get("state") or "N/A").upper()
+                if plan_state == "COMPLETE":
+                    plan_status = self.STATUS_HEALTHY
+                elif plan_state in {"ERROR", "FAILED"}:
+                    plan_status = self.STATUS_CRITICAL
+                else:
+                    plan_status = self.STATUS_RECOMMENDED
+
+                recovery_plan_rows.append({
+                    "name": status_block.get("name") or spec_block.get("name") or "Unnamed",
+                    "primary_location": primary_name,
+                    "recovery_location": ", ".join(recovery_names) or "N/A",
+                    "stage_count": len(resources.get("stage_list") or []),
+                    "network_mapping_count": mapping_count,
+                    "status": plan_status,
+                })
+                continue
+
             primary_name, primary_ids = _dr_location(plan.get("primaryLocation"))
             recovery_name, recovery_ids = _dr_location(plan.get("recoveryLocation"))
             referenced_ids = set(primary_ids + recovery_ids)
@@ -6001,6 +6107,12 @@ def _generate_storage_chart_png(findings: dict) -> Optional[str]:
 
 
 def generate_report(findings: dict, output_path: str) -> None:
+    # The Node builder runs from the script directory so local node_modules can
+    # be resolved. Normalize the requested report path first so relative
+    # --output-dir values still write to the caller's intended directory.
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     # Ensure docx is available locally
     if not _ensure_docx_installed():
         print("    [ERROR] Cannot generate report — docx package unavailable.")
@@ -6088,13 +6200,13 @@ class _TeeStream:
         return getattr(self.terminal, "encoding", "utf-8")
 
 
-def start_execution_log(output_dir: str) -> str:
+def start_execution_log(output_dir: str, timestamp: Optional[str] = None) -> str:
     """Capture console output in an output-dir/logs timestamped log file."""
     output_dir = os.path.abspath(output_dir or ".")
     log_dir = os.path.join(output_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = timestamp or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     base_name = f"Nutanix_Health_Check_{timestamp}"
     log_path = os.path.join(log_dir, f"{base_name}.log")
     sequence = 1
@@ -6208,7 +6320,8 @@ def preflight_required_support_files(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    start_execution_log(args.output_dir)
+    run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    start_execution_log(args.output_dir, run_timestamp)
 
     # Validate required CSV files before prompting for Prism Central details.
     preflight_required_support_files(args)
@@ -6223,7 +6336,10 @@ def main() -> None:
         if isinstance(cluster_name, list):
             cluster_name = cluster_name[0].get("name", "Cluster") if cluster_name else "Cluster"
         findings = HealthAnalyser(raw, customer, cluster_name, args.os_compat_csv, args.aos_eol_csv).analyse_all()
-        out_path = os.path.join(args.output_dir, f"{safe_filename(cluster_name)}_Health_Check.docx")
+        out_path = os.path.join(
+            args.output_dir,
+            f"{safe_filename(cluster_name)}_Health_Check_{run_timestamp}.docx",
+        )
         print("Generating report ...")
         generate_report(findings, out_path)
         print(f"\nDone! Report: {out_path}")
@@ -6289,7 +6405,10 @@ def main() -> None:
 
         # Save raw JSON
         safe_name    = safe_filename(cluster_name)
-        raw_json_path = os.path.join(args.output_dir, f"{safe_name}_raw.json")
+        raw_json_path = os.path.join(
+            args.output_dir,
+            f"{safe_name}_raw_{run_timestamp}.json",
+        )
         with open(raw_json_path, "w", encoding="utf-8") as f:
             json.dump(raw, f, indent=2)
         print(f"      Raw data saved: {raw_json_path}")
@@ -6304,7 +6423,10 @@ def main() -> None:
 
         # Analyse
         findings  = HealthAnalyser(raw, customer, cluster_name, args.os_compat_csv, args.aos_eol_csv).analyse_all()
-        out_path  = os.path.join(args.output_dir, f"{safe_name}_Health_Check.docx")
+        out_path = os.path.join(
+            args.output_dir,
+            f"{safe_name}_Health_Check_{run_timestamp}.docx",
+        )
 
         # Generate report
         print(f"      Generating report ...")
