@@ -522,6 +522,7 @@ class ClusterDataCollector:
             ("ahv_version",         self._ahv_version),         # uses VM host UUIDs as fallback
             ("alerts",              self._alerts),
             ("protection_policies", self._protection_policies),
+            ("recovery_plans",      self._recovery_plans),
             ("storage_stats",       self._storage_stats),
             ("cluster_stats",       self._cluster_stats),
             ("cluster_stats_7d",    self._cluster_stats_7d),
@@ -1064,6 +1065,20 @@ class ClusterDataCollector:
         return []
 
     def _protection_policies(self):
+        # Current Prism Central Data Policies API.
+        for ver in ["v4.2", "v4.1"]:
+            try:
+                response = self.client.get(
+                    f"/datapolicies/{ver}/config/protection-policies",
+                    {"$limit": 100},
+                )
+                policies = response.get("data", []) if isinstance(response, dict) else []
+                if isinstance(policies, list) and policies:
+                    return policies
+            except Exception:
+                continue
+
+        # Compatibility fallbacks for older environments.
         for path in [
             "/dataprotection/v4.0/config/protection-policies",
             "/dataprotection/v4.0/config/protection-rules",
@@ -1072,6 +1087,44 @@ class ClusterDataCollector:
                 result = self.client.paginate(path)
                 if result is not None:
                     return result
+            except Exception:
+                continue
+        return []
+
+    def _recovery_plans(self):
+        """Collect v4 Recovery Plans and their report-friendly subresources."""
+        for ver in ["v4.2", "v4.1"]:
+            try:
+                response = self.client.get(
+                    f"/datapolicies/{ver}/config/recovery-plans",
+                    {"$limit": 100},
+                )
+                plans = response.get("data", []) if isinstance(response, dict) else []
+                if not isinstance(plans, list):
+                    continue
+
+                enriched = []
+                for plan in plans:
+                    if not isinstance(plan, dict):
+                        continue
+                    item = dict(plan)
+                    ext_id = item.get("extId")
+                    if ext_id:
+                        for key, child_path in [
+                            ("_stages", "stages"),
+                            ("_network_mappings", "network-mappings"),
+                        ]:
+                            try:
+                                child = self.client.get(
+                                    f"/datapolicies/{ver}/config/recovery-plans/{ext_id}/{child_path}",
+                                    {"$limit": 100},
+                                )
+                                rows = child.get("data", []) if isinstance(child, dict) else []
+                                item[key] = rows if isinstance(rows, list) else []
+                            except Exception:
+                                item[key] = []
+                    enriched.append(item)
+                return enriched
             except Exception:
                 continue
         return []
@@ -2314,19 +2367,188 @@ class HealthAnalyser:
         }
 
     def analyse_protection(self) -> dict:
-        pols = self._safe_list("protection_policies")
-        if not pols:
-            recs   = ["No protection policies detected."]
-            status = self.STATUS_HEALTHY
+        policies = self._safe_list("protection_policies")
+        recovery_plans = self._safe_list("recovery_plans")
+        cluster = self._cluster_first()
+        cluster_ext_id = str(cluster.get("extId") or cluster.get("uuid") or "")
+
+        catalog = self._safe_list("cluster_catalog")
+        cluster_names = {
+            str(item.get("extId") or item.get("uuid")): str(item.get("name") or "")
+            for item in catalog if isinstance(item, dict)
+        }
+        if cluster_ext_id:
+            cluster_names[cluster_ext_id] = self.cluster_name
+
+        def _cluster_name(ext_id):
+            ext_id = str(ext_id or "")
+            if not ext_id:
+                return "All clusters"
+            return cluster_names.get(ext_id) or f"{ext_id[:8]}…"
+
+        def _replication_cluster_ids(location):
+            if not isinstance(location, dict):
+                return []
+            sublocation = location.get("replicationSubLocation") or {}
+            values = sublocation.get("clusterExtIds") or []
+            return [str(value) for value in values if value]
+
+        def _location_display(location):
+            ids = _replication_cluster_ids(location)
+            return ", ".join(_cluster_name(value) for value in ids) if ids else "All clusters"
+
+        def _format_rpo(seconds):
+            if not isinstance(seconds, (int, float)):
+                return "N/A"
+            seconds = int(seconds)
+            if seconds == 0:
+                return "Synchronous"
+            if seconds % 86400 == 0:
+                value, unit = seconds // 86400, "day"
+            elif seconds % 3600 == 0:
+                value, unit = seconds // 3600, "hour"
+            elif seconds % 60 == 0:
+                value, unit = seconds // 60, "minute"
+            else:
+                return f"{seconds} seconds"
+            return f"{value} {unit}{'' if value == 1 else 's'}"
+
+        def _format_retention(retention):
+            if not isinstance(retention, dict) or not retention:
+                return "N/A"
+            object_type = str(retention.get("$objectType") or "")
+            parts = []
+            for label, key in [("Local", "local"), ("Remote", "remote")]:
+                value = retention.get(key)
+                if isinstance(value, dict):
+                    interval = str(value.get("snapshotIntervalType") or "").replace("_", " ").title()
+                    frequency = value.get("frequency")
+                    detail = " ".join(str(v) for v in [interval, f"x{frequency}" if frequency is not None else ""] if v)
+                elif isinstance(value, (int, float)):
+                    detail = f"{int(value)} snapshots"
+                else:
+                    detail = ""
+                if detail:
+                    parts.append(f"{label}: {detail}")
+            if parts:
+                return "; ".join(parts)
+            return object_type.rsplit(".", 1)[-1].replace("Retention", "") or "Configured"
+
+        policy_rows = []
+        schedule_rows = []
+        paused_schedule_count = 0
+
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            locations = policy.get("replicationLocations") or []
+            label_map = {
+                str(location.get("label")): location
+                for location in locations
+                if isinstance(location, dict) and location.get("label")
+            }
+            current_labels = {
+                label for label, location in label_map.items()
+                if not _replication_cluster_ids(location) or cluster_ext_id in _replication_cluster_ids(location)
+            }
+            if cluster_ext_id and label_map and not current_labels:
+                continue
+
+            roles = {
+                "Primary" if location.get("isPrimary") is True else "Recovery"
+                for label, location in label_map.items() if label in current_labels
+            }
+            configurations = policy.get("replicationConfigurations") or []
+            relevant_configurations = []
+            policy_paused = 0
+            for configuration in configurations:
+                if not isinstance(configuration, dict):
+                    continue
+                source_label = str(configuration.get("sourceLocationLabel") or "")
+                remote_label = str(configuration.get("remoteLocationLabel") or "")
+                if current_labels and source_label not in current_labels and remote_label not in current_labels:
+                    continue
+                schedule = configuration.get("schedule") or {}
+                paused = schedule.get("isReplicationPaused") is True
+                if paused:
+                    paused_schedule_count += 1
+                    policy_paused += 1
+                source = _location_display(label_map.get(source_label, {}))
+                target = _location_display(label_map.get(remote_label, {}))
+                schedule_rows.append({
+                    "policy": policy.get("name") or "Unnamed",
+                    "direction": f"{source} → {target}",
+                    "rpo": _format_rpo(schedule.get("recoveryPointObjectiveTimeSeconds")),
+                    "retention": _format_retention(schedule.get("retention")),
+                    "recovery_point_type": str(schedule.get("recoveryPointType") or "N/A").replace("_", " ").title(),
+                    "status": self.STATUS_CRITICAL if paused else self.STATUS_HEALTHY,
+                })
+                relevant_configurations.append(configuration)
+
+            policy_rows.append({
+                "name": policy.get("name") or "Unnamed",
+                "role": " / ".join(sorted(roles)) if roles else "Applicable",
+                "category_count": len(policy.get("categoryIds") or []),
+                "schedule_count": len(relevant_configurations),
+                "paused_count": policy_paused,
+                "status": self.STATUS_CRITICAL if policy_paused else self.STATUS_HEALTHY,
+            })
+
+        def _dr_location(location):
+            if not isinstance(location, dict):
+                return "N/A", []
+            refs = location.get("clusters") or []
+            ids = []
+            names = []
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                ext_id = str(ref.get("extId") or ref.get("uuid") or "")
+                if ext_id:
+                    ids.append(ext_id)
+                names.append(str(ref.get("name") or _cluster_name(ext_id)))
+            return (", ".join(value for value in names if value) or "Remote domain manager"), ids
+
+        recovery_plan_rows = []
+        for plan in recovery_plans:
+            if not isinstance(plan, dict):
+                continue
+            primary_name, primary_ids = _dr_location(plan.get("primaryLocation"))
+            recovery_name, recovery_ids = _dr_location(plan.get("recoveryLocation"))
+            referenced_ids = set(primary_ids + recovery_ids)
+            if cluster_ext_id and referenced_ids and cluster_ext_id not in referenced_ids:
+                continue
+            recovery_plan_rows.append({
+                "name": plan.get("name") or "Unnamed",
+                "primary_location": primary_name,
+                "recovery_location": recovery_name,
+                "stage_count": len(plan.get("_stages") or []),
+                "network_mapping_count": len(plan.get("_network_mappings") or []),
+                "status": self.STATUS_HEALTHY,
+            })
+
+        if paused_schedule_count:
+            status = self.STATUS_CRITICAL
+            recs = ["Resume paused protection-policy replication after resolving the underlying issue."]
+        elif not policy_rows:
+            status = self.STATUS_RECOMMENDED
+            recs = ["Configure or assign a Prism Central Protection Policy for workloads that require recovery protection."]
         else:
-            recs   = ["Verify snapshot retention schedules meet RPO requirements.",
-                      "Ensure critical VMs are covered by at least one protection policy."]
             status = self.STATUS_HEALTHY
+            recs = [
+                "Confirm protected categories include all critical workloads.",
+                "Verify RPO and retention settings align with business recovery requirements.",
+            ]
+
         return {
-            "status":          status,
-            "policy_count":    len(pols),
-            "policies":        [{"name": p.get("name", "Unnamed"), "description": p.get("description", "")}
-                                for p in pols[:10]],
+            "status": status,
+            "policy_count": len(policy_rows),
+            "policies": policy_rows,
+            "schedules": schedule_rows,
+            "schedule_count": len(schedule_rows),
+            "paused_schedule_count": paused_schedule_count,
+            "recovery_plan_count": len(recovery_plan_rows),
+            "recovery_plans": recovery_plan_rows,
             "recommendations": recs,
         }
 
@@ -4043,7 +4265,7 @@ const LINK_BLUE = "0563C1";
 const SECTION_BOOKMARKS = {
   "Virtual Machines Summary": "sec_virtual_machines",
   "Alerts Summary": "sec_alerts",
-  "Protection Domain Summary": "sec_protection_domain",
+  "Data Protection Summary": "sec_data_protection",
   "Cluster CPU Summary": "sec_cluster_cpu_summary",
   "Cluster Memory Summary": "sec_cluster_memory_summary",
   "Cluster Storage Summary": "sec_cluster_storage_summary",
@@ -4212,7 +4434,7 @@ const C = D.cluster;
 const summaryStatuses = [
   ["Alerts Summary",               D.health.status],
   ["Virtual Machines Summary",     D.vms.status],
-  ["Protection Domain Summary",    D.protection.status],
+  ["Data Protection Summary",      D.protection.status],
   ["Cluster CPU Summary",  D.cpu.status],
   ["Cluster Memory Summary", D.memory.status],
   ["Network Summary",              D.network.status],
@@ -5124,6 +5346,78 @@ function recommendedActionsTable() {
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [1600, 5200, 4000], rows: [new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Priority", 1600), hdrCell("Recommendation", 5200), hdrCell("Reason", 4000)] }), ...actions.map((a, i) => new TableRow({ cantSplit: true, children: [cell(a.priority, { width: 1600, shading: priorityColor(a.priority), bold: true }), cell(a.recommendation, { width: 5200, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }), cell(a.reason, { width: 4000, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT })] }))] });
 }
 
+function protectionPolicySummaryTable() {
+  const rows = Array.isArray(D.protection.policies) ? D.protection.policies : [];
+  const CW = [3000, 1800, 1600, 1600, 1300, 1500];
+  const dataRows = rows.length ? rows.map((p, i) => {
+    const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+    return new TableRow({ cantSplit: true, children: [
+      cell(p.name || "Unnamed", { width: CW[0], shading: bg, bold: true }),
+      cell(p.role || "Applicable", { width: CW[1], shading: bg }),
+      cell(String(p.category_count ?? 0), { width: CW[2], shading: bg, center: true }),
+      cell(String(p.schedule_count ?? 0), { width: CW[3], shading: bg, center: true }),
+      cell(String(p.paused_count ?? 0), { width: CW[4], shading: bg, center: true }),
+      securityStatusCell(p.status, CW[5], bg),
+    ]});
+  }) : [new TableRow({ cantSplit: true, children: [
+    cell("N/A", { width: CW[0], bold: true }),
+    cell("No applicable Protection Policies found", { width: CW[1] + CW[2] + CW[3] + CW[4] }),
+    securityStatusCell("Recommended", CW[5], "FFFFFF"),
+  ]})];
+  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Policy", CW[0]), hdrCell("Cluster Role", CW[1]), hdrCell("Categories", CW[2]), hdrCell("Schedules", CW[3]), hdrCell("Paused", CW[4]), hdrCell("Status", CW[5])] }),
+    ...dataRows,
+  ]});
+}
+
+function protectionScheduleSummaryTable() {
+  const rows = Array.isArray(D.protection.schedules) ? D.protection.schedules : [];
+  const CW = [1700, 2800, 1200, 2400, 1200, 1500];
+  const dataRows = rows.length ? rows.map((s, i) => {
+    const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+    return new TableRow({ cantSplit: true, children: [
+      cell(s.policy || "Unnamed", { width: CW[0], shading: bg, bold: true }),
+      cell(s.direction || "N/A", { width: CW[1], shading: bg }),
+      cell(s.rpo || "N/A", { width: CW[2], shading: bg, center: true }),
+      cell(s.retention || "N/A", { width: CW[3], shading: bg }),
+      cell(s.recovery_point_type || "N/A", { width: CW[4], shading: bg }),
+      securityStatusCell(s.status, CW[5], bg),
+    ]});
+  }) : [new TableRow({ cantSplit: true, children: [
+    cell("N/A", { width: CW[0], bold: true }),
+    cell("No applicable replication schedules found", { width: CW[1] + CW[2] + CW[3] + CW[4] }),
+    securityStatusCell("N/A", CW[5], "FFFFFF"),
+  ]})];
+  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Policy", CW[0]), hdrCell("Direction", CW[1]), hdrCell("RPO", CW[2]), hdrCell("Retention", CW[3]), hdrCell("Type", CW[4]), hdrCell("Status", CW[5])] }),
+    ...dataRows,
+  ]});
+}
+
+function recoveryPlanSummaryTable() {
+  const rows = Array.isArray(D.protection.recovery_plans) ? D.protection.recovery_plans : [];
+  const CW = [2500, 2300, 2300, 1100, 1100, 1500];
+  const dataRows = rows.length ? rows.map((p, i) => {
+    const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+    return new TableRow({ cantSplit: true, children: [
+      cell(p.name || "Unnamed", { width: CW[0], shading: bg, bold: true }),
+      cell(p.primary_location || "N/A", { width: CW[1], shading: bg }),
+      cell(p.recovery_location || "N/A", { width: CW[2], shading: bg }),
+      cell(String(p.stage_count ?? 0), { width: CW[3], shading: bg, center: true }),
+      cell(String(p.network_mapping_count ?? 0), { width: CW[4], shading: bg, center: true }),
+      securityStatusCell(p.status, CW[5], bg),
+    ]});
+  }) : [new TableRow({ cantSplit: true, children: [
+    cell("N/A", { width: CW[0], bold: true }),
+    cell("No v4 Recovery Plans configured", { width: CW[1] + CW[2] + CW[3] + CW[4] }),
+    securityStatusCell("N/A", CW[5], "FFFFFF"),
+  ]})];
+  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Recovery Plan", CW[0]), hdrCell("Primary", CW[1]), hdrCell("Recovery", CW[2]), hdrCell("Stages", CW[3]), hdrCell("Mappings", CW[4]), hdrCell("Status", CW[5])] }),
+    ...dataRows,
+  ]});
+}
+
 function ngtSummaryTable() {
   const vms = D.vms.vm_list || [];
   const ignoredNames = new Set(D.vms.system_vm_ignored || []);
@@ -5378,12 +5672,20 @@ const children = [
   ...cvmTable(),
   pageBreak(),
 
-  // PROTECTION
-  heading1("Protection Domain Summary"),
-  sectionTable("Protection Policies", D.protection.status,
-    `• Protection policies configured: ${D.protection.policy_count}\n` +
-    (D.protection.policies.length ? D.protection.policies.map(p => `• ${p.name}`).join("\n") : "• No protection policies found."),
+  // DATA PROTECTION
+  heading1("Data Protection Summary"),
+  sectionTable("Data Protection", D.protection.status,
+    `• Applicable Protection Policies: ${D.protection.policy_count || 0}\n` +
+    `• Applicable Replication Schedules: ${D.protection.schedule_count || 0}\n` +
+    `• Paused Replication Schedules: ${D.protection.paused_schedule_count || 0}\n` +
+    `• Recovery Plans: ${D.protection.recovery_plan_count || 0}`,
     D.protection.recommendations),
+  heading2("Protection Policy Summary"),
+  protectionPolicySummaryTable(),
+  heading2("Replication Schedule Summary"),
+  protectionScheduleSummaryTable(),
+  heading2("Recovery Plan Summary"),
+  recoveryPlanSummaryTable(),
   pageBreak(),
 
   // CPU
@@ -5981,6 +6283,9 @@ def main() -> None:
         # Collect
         collector = ClusterDataCollector(client, cluster_uuid, cluster_name)
         raw       = collector.collect_all()
+        # Preserve the PC cluster catalog so cross-cluster protection-policy
+        # references can be rendered with names instead of UUIDs.
+        raw["cluster_catalog"] = clusters
 
         # Save raw JSON
         safe_name    = safe_filename(cluster_name)
