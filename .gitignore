@@ -6,3 +6,4 @@ _report_builder.js
 reports/
 *_Health_Check.docx
 *_raw.json
+*.log
