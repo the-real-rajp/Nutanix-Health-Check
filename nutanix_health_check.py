@@ -523,6 +523,7 @@ class ClusterDataCollector:
             ("alerts",              self._alerts),
             ("protection_policies", self._protection_policies),
             ("recovery_plans",      self._recovery_plans),
+            ("recovery_plan_jobs", self._recovery_plan_jobs),
             ("storage_stats",       self._storage_stats),
             ("cluster_stats",       self._cluster_stats),
             ("cluster_stats_7d",    self._cluster_stats_7d),
@@ -1163,6 +1164,65 @@ class ClusterDataCollector:
         except Exception:
             return []
         return plans
+
+    def _recovery_plan_jobs(self):
+        """Collect Recovery Plan execution history for validation/test/failover status."""
+        jobs = []
+
+        # Newer Recovery Plans expose their execution history through the v4
+        # Data Protection namespace. Keep this first so v4-only environments
+        # do not need to depend on a legacy endpoint.
+        for ver in ["v4.2", "v4.1"]:
+            try:
+                response = self.client.get(
+                    f"/dataprotection/{ver}/config/recovery-plan-jobs",
+                    {"$limit": 100},
+                )
+                page = response.get("data", []) if isinstance(response, dict) else []
+                if isinstance(page, list) and page:
+                    for job in page:
+                        if isinstance(job, dict):
+                            item = dict(job)
+                            item["_api_generation"] = "v4"
+                            jobs.append(item)
+                    break
+            except Exception:
+                continue
+
+        # Legacy v3 Recovery Plans (including plans shown by the older PC UI)
+        # record validation, test failover, and failover runs as Recovery Plan
+        # Jobs. Collect every page so the analyser can select the latest run of
+        # each action type for each plan.
+        offset = 0
+        page_length = 100
+        try:
+            while True:
+                response = self.client.post(
+                    "/nutanix/v3/recovery_plan_jobs/list",
+                    body={
+                        "kind": "recovery_plan_job",
+                        "length": page_length,
+                        "offset": offset,
+                    },
+                )
+                page = response.get("entities", []) if isinstance(response, dict) else []
+                if not isinstance(page, list) or not page:
+                    break
+                for job in page:
+                    if isinstance(job, dict):
+                        item = dict(job)
+                        item["_api_generation"] = "v3"
+                        jobs.append(item)
+
+                metadata = response.get("metadata", {}) if isinstance(response, dict) else {}
+                total = metadata.get("total_matches")
+                offset += len(page)
+                if len(page) < page_length or (isinstance(total, int) and offset >= total):
+                    break
+        except Exception:
+            pass
+
+        return jobs
 
     def _storage_containers(self):
         """Fetch storage containers; also used early to detect API version."""
@@ -2404,6 +2464,7 @@ class HealthAnalyser:
     def analyse_protection(self) -> dict:
         policies = self._safe_list("protection_policies")
         recovery_plans = self._safe_list("recovery_plans")
+        recovery_plan_jobs = self._safe_list("recovery_plan_jobs")
         cluster = self._cluster_first()
         cluster_ext_id = str(cluster.get("extId") or cluster.get("uuid") or "")
 
@@ -2544,6 +2605,122 @@ class HealthAnalyser:
                 names.append(str(ref.get("name") or _cluster_name(ext_id)))
             return (", ".join(value for value in names if value) or "Remote domain manager"), ids
 
+        def _job_details(job):
+            """Return plan UUID, action, result, and timestamp from v3/v4 jobs."""
+            if not isinstance(job, dict):
+                return "", "", "", ""
+
+            status_block = job.get("status") if isinstance(job.get("status"), dict) else {}
+            spec_block = job.get("spec") if isinstance(job.get("spec"), dict) else {}
+            status_resources = status_block.get("resources") if isinstance(status_block.get("resources"), dict) else {}
+            spec_resources = spec_block.get("resources") if isinstance(spec_block.get("resources"), dict) else {}
+            resources = status_resources or spec_resources
+
+            reference = resources.get("recovery_plan_reference") or resources.get("recoveryPlanReference") or {}
+            plan_id = str(
+                job.get("recoveryPlanExtId")
+                or job.get("recovery_plan_ext_id")
+                or (reference.get("uuid") if isinstance(reference, dict) else "")
+                or (reference.get("extId") if isinstance(reference, dict) else "")
+                or ""
+            )
+
+            execution_parameters = resources.get("execution_parameters") or resources.get("executionParameters") or {}
+            action = str(
+                job.get("actionType")
+                or job.get("action_type")
+                or (execution_parameters.get("action_type") if isinstance(execution_parameters, dict) else "")
+                or (execution_parameters.get("actionType") if isinstance(execution_parameters, dict) else "")
+                or ""
+            ).upper()
+
+            execution = status_block.get("execution_status") or status_block.get("executionStatus") or {}
+            if isinstance(execution, dict):
+                result = execution.get("status") or ""
+            else:
+                result = execution
+            top_level_status = job.get("status") if not isinstance(job.get("status"), dict) else ""
+            result = str(
+                result
+                or job.get("executionStatus")
+                or top_level_status
+            ).upper()
+            if not result:
+                result = str(status_block.get("state") or "").upper()
+
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            timestamp = str(
+                status_block.get("end_time")
+                or status_block.get("endTime")
+                or job.get("completionTime")
+                or job.get("endTime")
+                or status_block.get("start_time")
+                or status_block.get("startTime")
+                or job.get("startTime")
+                or metadata.get("last_update_time")
+                or metadata.get("lastUpdateTime")
+                or metadata.get("creation_time")
+                or metadata.get("creationTime")
+                or ""
+            )
+            return plan_id, action, result, timestamp
+
+        def _job_category(action):
+            action = str(action or "").upper()
+            if action == "VALIDATE":
+                return "validation"
+            if action == "TEST_FAILOVER":
+                return "test"
+            if action in {
+                "FAILOVER", "MIGRATE", "LIVE_MIGRATE", "PLANNED_FAILOVER",
+                "UNPLANNED_FAILOVER",
+            }:
+                return "failover"
+            return ""
+
+        def _format_job_result(result, timestamp):
+            result = str(result or "").upper()
+            result_labels = {
+                "COMPLETE": "Succeeded",
+                "COMPLETED": "Succeeded",
+                "SUCCEEDED": "Succeeded",
+                "SUCCESS": "Succeeded",
+                "COMPLETED_WITH_WARNING": "Succeeded with Warnings",
+                "SUCCEEDED_WITH_WARNING": "Succeeded with Warnings",
+                "FAILED": "Failed",
+                "FAILURE": "Failed",
+                "ERROR": "Failed",
+                "RUNNING": "In Progress",
+                "IN_PROGRESS": "In Progress",
+                "PENDING": "Pending",
+                "QUEUED": "Pending",
+                "CANCELLED": "Cancelled",
+                "CANCELED": "Cancelled",
+            }
+            label = result_labels.get(result, result.replace("_", " ").title() if result else "Unknown")
+            date_label = ""
+            if timestamp:
+                try:
+                    parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                    date_label = f"{parsed.strftime('%b')} {parsed.day}, {parsed.year}"
+                except (TypeError, ValueError):
+                    date_label = ""
+            return f"{label} - {date_label}" if date_label else label
+
+        jobs_by_plan = {}
+        for job in recovery_plan_jobs:
+            plan_id, action, result, timestamp = _job_details(job)
+            category = _job_category(action)
+            if not plan_id or not category:
+                continue
+            current = jobs_by_plan.setdefault(plan_id, {}).get(category)
+            if current is None or str(timestamp) > str(current[1]):
+                jobs_by_plan[plan_id][category] = (result, timestamp)
+
+        def _last_job_status(plan_id, category):
+            result = jobs_by_plan.get(str(plan_id or ""), {}).get(category)
+            return _format_job_result(*result) if result else "Not Run"
+
         recovery_plan_rows = []
         for plan in recovery_plans:
             if not isinstance(plan, dict):
@@ -2611,10 +2788,23 @@ class HealthAnalyser:
 
                 recovery_plan_rows.append({
                     "name": status_block.get("name") or spec_block.get("name") or "Unnamed",
+                    "ext_id": plan.get("metadata", {}).get("uuid") if isinstance(plan.get("metadata"), dict) else "",
                     "primary_location": primary_name,
                     "recovery_location": ", ".join(recovery_names) or "N/A",
                     "stage_count": len(resources.get("stage_list") or []),
                     "network_mapping_count": mapping_count,
+                    "last_validation_status": _last_job_status(
+                        plan.get("metadata", {}).get("uuid") if isinstance(plan.get("metadata"), dict) else "",
+                        "validation",
+                    ),
+                    "last_test_status": _last_job_status(
+                        plan.get("metadata", {}).get("uuid") if isinstance(plan.get("metadata"), dict) else "",
+                        "test",
+                    ),
+                    "last_failover_status": _last_job_status(
+                        plan.get("metadata", {}).get("uuid") if isinstance(plan.get("metadata"), dict) else "",
+                        "failover",
+                    ),
                     "status": plan_status,
                 })
                 continue
@@ -2626,10 +2816,14 @@ class HealthAnalyser:
                 continue
             recovery_plan_rows.append({
                 "name": plan.get("name") or "Unnamed",
+                "ext_id": plan.get("extId") or "",
                 "primary_location": primary_name,
                 "recovery_location": recovery_name,
                 "stage_count": len(plan.get("_stages") or []),
                 "network_mapping_count": len(plan.get("_network_mappings") or []),
+                "last_validation_status": _last_job_status(plan.get("extId"), "validation"),
+                "last_test_status": _last_job_status(plan.get("extId"), "test"),
+                "last_failover_status": _last_job_status(plan.get("extId"), "failover"),
                 "status": self.STATUS_HEALTHY,
             })
 
@@ -5502,7 +5696,7 @@ function protectionScheduleSummaryTable() {
 
 function recoveryPlanSummaryTable() {
   const rows = Array.isArray(D.protection.recovery_plans) ? D.protection.recovery_plans : [];
-  const CW = [2500, 2300, 2300, 1100, 1100, 1500];
+  const CW = [1250, 1050, 1050, 600, 700, 1700, 1500, 1500, 1450];
   const dataRows = rows.length ? rows.map((p, i) => {
     const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
     return new TableRow({ cantSplit: true, children: [
@@ -5511,15 +5705,18 @@ function recoveryPlanSummaryTable() {
       cell(p.recovery_location || "N/A", { width: CW[2], shading: bg }),
       cell(String(p.stage_count ?? 0), { width: CW[3], shading: bg, center: true }),
       cell(String(p.network_mapping_count ?? 0), { width: CW[4], shading: bg, center: true }),
-      securityStatusCell(p.status, CW[5], bg),
+      cell(p.last_validation_status || "Not Run", { width: CW[5], shading: bg }),
+      cell(p.last_test_status || "Not Run", { width: CW[6], shading: bg }),
+      cell(p.last_failover_status || "Not Run", { width: CW[7], shading: bg }),
+      securityStatusCell(p.status, CW[8], bg),
     ]});
   }) : [new TableRow({ cantSplit: true, children: [
     cell("N/A", { width: CW[0], bold: true }),
-    cell("No v4 Recovery Plans configured", { width: CW[1] + CW[2] + CW[3] + CW[4] }),
-    securityStatusCell("N/A", CW[5], "FFFFFF"),
+    cell("No Recovery Plans configured", { width: CW[1] + CW[2] + CW[3] + CW[4] + CW[5] + CW[6] + CW[7] }),
+    securityStatusCell("N/A", CW[8], "FFFFFF"),
   ]})];
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
-    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Recovery Plan", CW[0]), hdrCell("Primary", CW[1]), hdrCell("Recovery", CW[2]), hdrCell("Stages", CW[3]), hdrCell("Mappings", CW[4]), hdrCell("Status", CW[5])] }),
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Recovery Plan", CW[0]), hdrCell("Primary", CW[1]), hdrCell("Recovery", CW[2]), hdrCell("Stages", CW[3]), hdrCell("Mappings", CW[4]), hdrCell("Last Validation Status", CW[5]), hdrCell("Last Test Status", CW[6]), hdrCell("Last Failover Status", CW[7]), hdrCell("Status", CW[8])] }),
     ...dataRows,
   ]});
 }
