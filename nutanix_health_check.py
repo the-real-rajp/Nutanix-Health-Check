@@ -524,6 +524,8 @@ class ClusterDataCollector:
             ("protection_policies", self._protection_policies),
             ("recovery_plans",      self._recovery_plans),
             ("recovery_plan_jobs", self._recovery_plan_jobs),
+            ("pe_protection_domains", self._pe_protection_domains),
+            ("pe_remote_sites",      self._pe_remote_sites),
             ("storage_stats",       self._storage_stats),
             ("cluster_stats",       self._cluster_stats),
             ("cluster_stats_7d",    self._cluster_stats_7d),
@@ -1224,6 +1226,82 @@ class ClusterDataCollector:
 
         return jobs
 
+    def _pe_protection_domains(self):
+        """Collect legacy Prism Element Protection Domains and DP status."""
+        response, list_attempts = self._pe_v2_get_with_fallbacks(
+            "/protection_domains/"
+        )
+
+        # PE releases normally return {"entities": [...]}; retain support for
+        # a bare list and alternate collection keys so a valid response is not
+        # mistaken for an empty Protection Domain inventory.
+        if isinstance(response, dict):
+            entities = (
+                response.get("entities")
+                or response.get("protection_domains")
+                or response.get("protectionDomainList")
+                or []
+            )
+        elif isinstance(response, list):
+            entities = response
+        else:
+            entities = []
+        if not isinstance(entities, list):
+            entities = []
+
+        status, status_attempts = self._pe_v2_get_with_fallbacks(
+            "/protection_domains/status"
+        )
+        return {
+            "entities": [item for item in entities if isinstance(item, dict)],
+            "status": status if isinstance(status, dict) else {},
+            "collection": {
+                "successful": response is not None,
+                "source": next(
+                    (
+                        item.get("source")
+                        for item in list_attempts
+                        if item.get("successful")
+                    ),
+                    None,
+                ),
+                "list_attempts": list_attempts,
+                "status_attempts": status_attempts,
+            },
+        }
+
+    def _pe_remote_sites(self):
+        """Collect Prism Element Remote Sites used by legacy Protection Domains."""
+        response, attempts = self._pe_v2_get_with_fallbacks("/remote_sites/")
+        if isinstance(response, dict):
+            entities = (
+                response.get("entities")
+                or response.get("remote_sites")
+                or response.get("remoteSiteList")
+                or []
+            )
+        elif isinstance(response, list):
+            entities = response
+        else:
+            entities = []
+        if not isinstance(entities, list):
+            entities = []
+        return {
+            "entities": [item for item in entities if isinstance(item, dict)],
+            "collection": {
+                "successful": response is not None,
+                "source": next(
+                    (
+                        item.get("source")
+                        for item in attempts
+                        if item.get("successful")
+                    ),
+                    None,
+                ),
+                "attempts": attempts,
+            },
+        }
+
     def _storage_containers(self):
         """Fetch storage containers; also used early to detect API version."""
         for ver in ["v4.2", "v4.1", "v4.0.b1", "v4.0"]:
@@ -1376,6 +1454,105 @@ class ClusterDataCollector:
         except Exception:
             pass
         return None
+
+    def _pe_v2_get_with_fallbacks(self, path: str) -> tuple[Any, list[dict]]:
+        """Read a PE v2 resource directly, then through Prism Central.
+
+        A Prism Central account is not always valid on every registered Prism
+        Element cluster.  When the direct cluster-VIP request is rejected, PC
+        can proxy many Prism v2 reads when the target cluster UUID is supplied
+        in the ``clusterUuid`` header.  Some PC/AOS combinations instead use
+        the legacy ``proxyClusterUuid`` query parameter, so both forms are
+        attempted.  Attempt results are saved in the raw JSON to distinguish
+        an empty Protection Domain inventory from authentication, routing, or
+        API errors.
+        """
+        import requests as _req
+
+        path = "/" + str(path or "").lstrip("/")
+        attempts: list[dict] = []
+        auth = self.client.session.auth
+
+        request_specs: list[tuple[str, str, dict, dict]] = []
+        pe_ip = self._pe_vip()
+        if pe_ip:
+            request_specs.extend([
+                (
+                    "Prism Element v2",
+                    f"https://{pe_ip}:{self.client.port}/PrismGateway/services/rest/v2.0{path}",
+                    {},
+                    {},
+                ),
+                (
+                    "Prism Element v2 alternate path",
+                    f"https://{pe_ip}:{self.client.port}/api/nutanix/v2.0{path}",
+                    {},
+                    {},
+                ),
+            ])
+
+        pc_v2_url = (
+            f"https://{self.client.host}:{self.client.port}"
+            f"/PrismGateway/services/rest/v2.0{path}"
+        )
+        request_specs.extend([
+            (
+                "Prism Central v2 proxy header",
+                pc_v2_url,
+                {"clusterUuid": self.cluster_ext_id},
+                {},
+            ),
+            (
+                "Prism Central v2 proxy query",
+                pc_v2_url,
+                {},
+                {"proxyClusterUuid": self.cluster_ext_id},
+            ),
+        ])
+
+        for source, url, headers, params in request_specs:
+            attempt = {
+                "source": source,
+                "target": url.split("?", 1)[0],
+                "successful": False,
+            }
+            try:
+                response = _req.get(
+                    url,
+                    auth=auth,
+                    headers=headers,
+                    params=params,
+                    verify=False,
+                    timeout=20,
+                )
+                attempt["status_code"] = response.status_code
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        attempt["error"] = "Response was not valid JSON"
+                    else:
+                        attempt["successful"] = True
+                        attempts.append(attempt)
+                        return payload, attempts
+                else:
+                    try:
+                        error_payload = response.json()
+                        message = (
+                            error_payload.get("message")
+                            or error_payload.get("error")
+                            or error_payload.get("detailed_message")
+                        ) if isinstance(error_payload, dict) else None
+                        if message:
+                            attempt["error"] = str(message)[:500]
+                    except ValueError:
+                        if response.text:
+                            attempt["error"] = response.text.strip()[:500]
+            except Exception as exc:
+                attempt["error"] = str(exc)[:500]
+            attempts.append(attempt)
+
+        return None, attempts
 
     def _pe_v2_stats(self) -> Optional[dict]:
         """Fall back to Prism Element stats directly on the cluster VIP.
@@ -2465,6 +2642,38 @@ class HealthAnalyser:
         policies = self._safe_list("protection_policies")
         recovery_plans = self._safe_list("recovery_plans")
         recovery_plan_jobs = self._safe_list("recovery_plan_jobs")
+        alerts = self._safe_list("alerts")
+        pe_pd_payload = self.raw.get("pe_protection_domains", {})
+        pe_protection_domains = (
+            pe_pd_payload.get("entities", []) if isinstance(pe_pd_payload, dict) else []
+        )
+        if not isinstance(pe_protection_domains, list):
+            pe_protection_domains = []
+        pe_pd_collection = (
+            pe_pd_payload.get("collection", {})
+            if isinstance(pe_pd_payload, dict) else {}
+        )
+        pe_pd_collection_successful = bool(
+            pe_pd_collection.get("successful")
+        ) if isinstance(pe_pd_collection, dict) else False
+        pe_pd_collection_source = (
+            pe_pd_collection.get("source")
+            if isinstance(pe_pd_collection, dict) else None
+        )
+        pe_remote_payload = self.raw.get("pe_remote_sites", {})
+        pe_remote_sites = (
+            pe_remote_payload.get("entities", [])
+            if isinstance(pe_remote_payload, dict) else []
+        )
+        if not isinstance(pe_remote_sites, list):
+            pe_remote_sites = []
+        pe_remote_collection = (
+            pe_remote_payload.get("collection", {})
+            if isinstance(pe_remote_payload, dict) else {}
+        )
+        pe_remote_collection_successful = bool(
+            pe_remote_collection.get("successful")
+        ) if isinstance(pe_remote_collection, dict) else False
         cluster = self._cluster_first()
         cluster_ext_id = str(cluster.get("extId") or cluster.get("uuid") or "")
 
@@ -2588,6 +2797,210 @@ class HealthAnalyser:
                 "schedule_count": len(relevant_configurations),
                 "paused_count": policy_paused,
                 "status": self.STATUS_CRITICAL if policy_paused else self.STATUS_HEALTHY,
+            })
+
+        pe_pd_status = pe_pd_payload.get("status", {}) if isinstance(pe_pd_payload, dict) else {}
+        suspended_map = (
+            pe_pd_status.get("pd_suspended_schedules_map", {})
+            if isinstance(pe_pd_status, dict) else {}
+        )
+        if not isinstance(suspended_map, dict):
+            suspended_map = {}
+
+        pe_protection_domain_rows = []
+        pe_suspended_schedule_count = 0
+        for domain in pe_protection_domains:
+            if not isinstance(domain, dict):
+                continue
+            name = str(domain.get("name") or domain.get("protection_domain_name") or "Unnamed")
+            schedules = domain.get("cron_schedules") or []
+            if not isinstance(schedules, list):
+                schedules = []
+            schedule_suspended = (
+                domain.get("schedules_suspended") is True
+                or suspended_map.get(name) is True
+                or any(
+                    isinstance(schedule, dict) and schedule.get("suspended") is True
+                    for schedule in schedules
+                )
+            )
+            if schedule_suspended:
+                pe_suspended_schedule_count += 1
+
+            remote_sites = domain.get("remote_site_names") or []
+            if isinstance(remote_sites, str):
+                remote_sites = [remote_sites]
+            if not isinstance(remote_sites, list):
+                remote_sites = []
+            if not remote_sites:
+                remote_site = domain.get("remote_site")
+                if isinstance(remote_site, dict):
+                    remote_site = remote_site.get("name") or remote_site.get("remote_site_name")
+                if remote_site:
+                    remote_sites = [str(remote_site)]
+
+            vm_count = len(domain.get("vms") or []) if isinstance(domain.get("vms") or [], list) else 0
+            vg_count = len(domain.get("volume_groups") or []) if isinstance(domain.get("volume_groups") or [], list) else 0
+            file_count = len(domain.get("nfs_files") or []) if isinstance(domain.get("nfs_files") or [], list) else 0
+            entity_parts = []
+            if vm_count:
+                entity_parts.append(f"VMs: {vm_count}")
+            if vg_count:
+                entity_parts.append(f"VGs: {vg_count}")
+            if file_count:
+                entity_parts.append(f"Files: {file_count}")
+
+            ongoing = domain.get("ongoing_replication_count")
+            pending = domain.get("pending_replication_count")
+            ongoing = int(ongoing) if isinstance(ongoing, (int, float)) else 0
+            pending = int(pending) if isinstance(pending, (int, float)) else 0
+            if schedule_suspended:
+                state = "Schedules Suspended"
+                row_status = self.STATUS_CRITICAL
+            elif domain.get("marked_for_removal") is True:
+                state = "Removal Pending"
+                row_status = self.STATUS_RECOMMENDED
+            elif ongoing:
+                state = f"Replicating ({ongoing})"
+                row_status = self.STATUS_HEALTHY
+            elif pending:
+                state = f"Pending ({pending})"
+                row_status = self.STATUS_RECOMMENDED
+            elif domain.get("active") is True:
+                state = "Active"
+                row_status = self.STATUS_HEALTHY
+            else:
+                raw_state = str(domain.get("status") or "Configured").replace("_", " ").title()
+                state = raw_state
+                row_status = self.STATUS_HEALTHY
+
+            if domain.get("metro_avail") is True:
+                protection_type = "Metro Availability"
+            elif remote_sites:
+                protection_type = "Remote Replication"
+            else:
+                protection_type = "Local Snapshots"
+
+            hybrid_count = domain.get("hybrid_schedules_count")
+            hybrid_count = int(hybrid_count) if isinstance(hybrid_count, (int, float)) else 0
+            pe_protection_domain_rows.append({
+                "name": name,
+                "type": protection_type,
+                "role": str(domain.get("role") or "N/A").replace("_", " ").title(),
+                "protected_entities": "; ".join(entity_parts) or "N/A",
+                "remote_sites": ", ".join(str(site) for site in remote_sites if site) or "None",
+                "schedule_count": len(schedules) + hybrid_count,
+                "state": state,
+                "status": row_status,
+            })
+
+        def _remote_site_addresses(site):
+            addresses = set()
+            for key in ("remote_ip_ports", "remote_ip_address_ports"):
+                value = site.get(key)
+                if isinstance(value, dict):
+                    addresses.update(str(item) for item in value.keys() if item)
+            for value in site.get("ip_addresses") or []:
+                if value:
+                    addresses.add(str(value))
+
+            def walk(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        key_lower = str(key).lower()
+                        if isinstance(child, str) and (
+                            key_lower in {"ipv4", "ipv6", "hostname", "raw_string", "address"}
+                            or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", child.strip())
+                        ):
+                            if child.strip():
+                                addresses.add(child.strip())
+                        else:
+                            walk(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        walk(child)
+
+            walk(site.get("address_list") or [])
+            return ", ".join(sorted(addresses)) or "N/A"
+
+        def _remote_site_state(site):
+            state = (
+                site.get("connection_state")
+                or site.get("connectionState")
+                or site.get("status")
+                or site.get("state")
+            )
+            if isinstance(state, dict):
+                state = state.get("status") or state.get("state") or state.get("message")
+            if not state:
+                communication = site.get("last_successful_connection_time_in_usecs")
+                state = "Connected" if communication else "Configured"
+            return str(state).replace("_", " ").title()
+
+        pe_remote_site_rows = []
+        for site in pe_remote_sites:
+            if not isinstance(site, dict):
+                continue
+            site_type = (
+                site.get("remote_site_type")
+                or site.get("site_type")
+                or site.get("type")
+                or site.get("cloud_type")
+                or "Physical"
+            )
+            compression = site.get("compression_enabled")
+            bandwidth = site.get("bandwidth_policy_enabled")
+            pe_remote_site_rows.append({
+                "name": site.get("name") or site.get("remote_site_name") or "Unnamed",
+                "type": str(site_type).replace("_", " ").title(),
+                "addresses": _remote_site_addresses(site),
+                "compression": "Enabled" if compression is True else "Disabled" if compression is False else "N/A",
+                "bandwidth_policy": "Enabled" if bandwidth is True else "Disabled" if bandwidth is False else "N/A",
+                "state": _remote_site_state(site),
+            })
+        pe_remote_site_rows.sort(key=lambda item: str(item.get("name") or "").lower())
+
+        data_protection_alert_rows = []
+        for alert in alerts:
+            if not isinstance(alert, dict):
+                continue
+            title = str(alert.get("title") or "Active Data Protection Alert")
+            message = str(alert.get("message") or "")
+            classification = str(alert.get("classification") or "").upper()
+            searchable = f"{title} {message}".lower()
+            is_data_protection = (
+                classification in {"DR", "DISASTER RECOVERY"}
+                or any(
+                    term in searchable
+                    for term in (
+                        "protection domain",
+                        "recovery plan",
+                        "recovery point",
+                        "local backup",
+                        "replication",
+                    )
+                )
+            )
+            if not is_data_protection or "encryption key backup" in searchable:
+                continue
+            severity = str(alert.get("severity") or "INFO").upper()
+            alert_status = (
+                self.STATUS_CRITICAL
+                if "CRITICAL" in severity
+                else self.STATUS_RECOMMENDED
+                if severity in {"WARNING", "WARN"}
+                else self.STATUS_HEALTHY
+            )
+            data_protection_alert_rows.append({
+                "title": title,
+                "severity": severity.title(),
+                "details": message or "N/A",
+                "recommendation": str(
+                    alert.get("recommendedResolution")
+                    or alert.get("recommended_resolution")
+                    or "Review and remediate the alert in Prism Central."
+                ),
+                "status": alert_status,
             })
 
         def _dr_location(location):
@@ -2827,18 +3240,58 @@ class HealthAnalyser:
                 "status": self.STATUS_HEALTHY,
             })
 
-        if paused_schedule_count:
+        critical_dp_alerts = [
+            item for item in data_protection_alert_rows
+            if item.get("status") == self.STATUS_CRITICAL
+        ]
+        recommended_dp_alerts = [
+            item for item in data_protection_alert_rows
+            if item.get("status") == self.STATUS_RECOMMENDED
+        ]
+        has_data_protection = bool(
+            policy_rows or pe_protection_domain_rows or recovery_plan_rows
+        )
+
+        if critical_dp_alerts or paused_schedule_count or pe_suspended_schedule_count:
             status = self.STATUS_CRITICAL
-            recs = ["Resume paused protection-policy replication after resolving the underlying issue."]
-        elif not policy_rows:
+            recs = []
+            if paused_schedule_count:
+                recs.append("Resume paused protection-policy replication after resolving the underlying issue.")
+            if pe_suspended_schedule_count:
+                recs.append("Resume suspended Prism Element Protection Domain schedules after resolving the underlying issue.")
+        elif recommended_dp_alerts or not has_data_protection:
             status = self.STATUS_RECOMMENDED
-            recs = ["Configure or assign a Prism Central Protection Policy for workloads that require recovery protection."]
+            recs = []
         else:
             status = self.STATUS_HEALTHY
-            recs = [
+            recs = []
+
+        for alert in data_protection_alert_rows:
+            recommendation = str(alert.get("recommendation") or "").strip()
+            if recommendation and recommendation not in recs:
+                recs.append(recommendation)
+
+        if not has_data_protection:
+            recs.append(
+                "Configure Data Protection using Prism Element Protection Domains or Prism Central Protection Policies for workloads that require recovery protection."
+            )
+            if not pe_pd_collection_successful:
+                recs.append(
+                    "Verify Prism Element API access so legacy Protection Domain usage can be assessed."
+                )
+        else:
+            recs.extend([
                 "Confirm protected categories include all critical workloads.",
                 "Verify RPO and retention settings align with business recovery requirements.",
-            ]
+            ])
+            if pe_protection_domain_rows:
+                recs.append("Periodically validate Prism Element Protection Domain snapshots and recovery procedures.")
+            if not recovery_plan_rows:
+                recs.append(
+                    "Configure and validate a Recovery Plan where orchestrated failover is required."
+                )
+
+        recs = list(dict.fromkeys(recs))
 
         return {
             "status": status,
@@ -2847,6 +3300,16 @@ class HealthAnalyser:
             "schedules": schedule_rows,
             "schedule_count": len(schedule_rows),
             "paused_schedule_count": paused_schedule_count,
+            "pe_protection_domain_count": len(pe_protection_domain_rows),
+            "pe_protection_domains": pe_protection_domain_rows,
+            "pe_suspended_schedule_count": pe_suspended_schedule_count,
+            "pe_protection_domain_collection_successful": pe_pd_collection_successful,
+            "pe_protection_domain_collection_source": pe_pd_collection_source or "N/A",
+            "pe_remote_site_count": len(pe_remote_site_rows),
+            "pe_remote_sites": pe_remote_site_rows,
+            "pe_remote_site_collection_successful": pe_remote_collection_successful,
+            "data_protection_alert_count": len(data_protection_alert_rows),
+            "data_protection_alerts": data_protection_alert_rows,
             "recovery_plan_count": len(recovery_plan_rows),
             "recovery_plans": recovery_plan_rows,
             "recommendations": recs,
@@ -5648,7 +6111,7 @@ function recommendedActionsTable() {
 
 function protectionPolicySummaryTable() {
   const rows = Array.isArray(D.protection.policies) ? D.protection.policies : [];
-  const CW = [3000, 1800, 1600, 1600, 1300, 1500];
+  const CW = [3300, 2100, 1800, 1900, 1700];
   const dataRows = rows.length ? rows.map((p, i) => {
     const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
     return new TableRow({ cantSplit: true, children: [
@@ -5657,22 +6120,20 @@ function protectionPolicySummaryTable() {
       cell(String(p.category_count ?? 0), { width: CW[2], shading: bg, center: true }),
       cell(String(p.schedule_count ?? 0), { width: CW[3], shading: bg, center: true }),
       cell(String(p.paused_count ?? 0), { width: CW[4], shading: bg, center: true }),
-      securityStatusCell(p.status, CW[5], bg),
     ]});
   }) : [new TableRow({ cantSplit: true, children: [
     cell("N/A", { width: CW[0], bold: true }),
     cell("No applicable Protection Policies found", { width: CW[1] + CW[2] + CW[3] + CW[4] }),
-    securityStatusCell("Recommended", CW[5], "FFFFFF"),
   ]})];
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
-    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Policy", CW[0]), hdrCell("Cluster Role", CW[1]), hdrCell("Categories", CW[2]), hdrCell("Schedules", CW[3]), hdrCell("Paused", CW[4]), hdrCell("Status", CW[5])] }),
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Policy", CW[0]), hdrCell("Cluster Role", CW[1]), hdrCell("Categories", CW[2]), hdrCell("Schedules", CW[3]), hdrCell("Paused", CW[4])] }),
     ...dataRows,
   ]});
 }
 
 function protectionScheduleSummaryTable() {
   const rows = Array.isArray(D.protection.schedules) ? D.protection.schedules : [];
-  const CW = [1700, 2800, 1200, 2400, 1200, 1500];
+  const CW = [1900, 3000, 1300, 3000, 1600];
   const dataRows = rows.length ? rows.map((s, i) => {
     const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
     return new TableRow({ cantSplit: true, children: [
@@ -5681,22 +6142,152 @@ function protectionScheduleSummaryTable() {
       cell(s.rpo || "N/A", { width: CW[2], shading: bg, center: true }),
       cell(s.retention || "N/A", { width: CW[3], shading: bg }),
       cell(s.recovery_point_type || "N/A", { width: CW[4], shading: bg }),
-      securityStatusCell(s.status, CW[5], bg),
     ]});
   }) : [new TableRow({ cantSplit: true, children: [
     cell("N/A", { width: CW[0], bold: true }),
     cell("No applicable replication schedules found", { width: CW[1] + CW[2] + CW[3] + CW[4] }),
-    securityStatusCell("N/A", CW[5], "FFFFFF"),
   ]})];
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
-    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Policy", CW[0]), hdrCell("Direction", CW[1]), hdrCell("RPO", CW[2]), hdrCell("Retention", CW[3]), hdrCell("Type", CW[4]), hdrCell("Status", CW[5])] }),
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Policy", CW[0]), hdrCell("Direction", CW[1]), hdrCell("RPO", CW[2]), hdrCell("Retention", CW[3]), hdrCell("Type", CW[4])] }),
     ...dataRows,
   ]});
 }
 
+function dataProtectionAlertSection() {
+  const rows = Array.isArray(D.protection.data_protection_alerts) ? D.protection.data_protection_alerts : [];
+  if (!rows.length) return [];
+  const CW = [2300, 1200, 3700, 3600];
+  return [
+    heading2("Active Data Protection Alerts"),
+    new Table({
+      layout: TableLayoutType.AUTOFIT,
+      width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+      columnWidths: CW,
+      rows: [
+        new TableRow({ tableHeader: true, cantSplit: true, children: [
+          hdrCell("Alert", CW[0]),
+          hdrCell("Severity", CW[1]),
+          hdrCell("Details", CW[2]),
+          hdrCell("Recommended Action", CW[3]),
+        ]}),
+        ...rows.map((a, i) => {
+          const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+          return new TableRow({ cantSplit: true, children: [
+            cell(a.title || "Alert", { width: CW[0], shading: bg, bold: true }),
+            cell(a.severity || "Info", {
+              width: CW[1], shading: bg, bold: true,
+              color: STATUS_COLORS[a.status] || "000000",
+            }),
+            cell(a.details || "N/A", { width: CW[2], shading: bg }),
+            cell(a.recommendation || "Review in Prism Central.", { width: CW[3], shading: bg }),
+          ]});
+        }),
+      ],
+    }),
+  ];
+}
+
+function protectionPolicySection() {
+  const rows = Array.isArray(D.protection.policies) ? D.protection.policies : [];
+  return rows.length ? [heading2("PC Protection Policy Summary"), protectionPolicySummaryTable()] : [];
+}
+
+function protectionScheduleSection() {
+  const rows = Array.isArray(D.protection.schedules) ? D.protection.schedules : [];
+  return rows.length ? [heading2("PC Replication Schedule Summary"), protectionScheduleSummaryTable()] : [];
+}
+
+function peProtectionDomainSection() {
+  const rows = Array.isArray(D.protection.pe_protection_domains) ? D.protection.pe_protection_domains : [];
+  const collectionSucceeded = D.protection.pe_protection_domain_collection_successful === true;
+  if (!rows.length && collectionSucceeded) return [];
+  if (!rows.length) {
+    return [
+      heading2("PE Protection Domain Summary"),
+      body("Protection Domain inventory could not be collected from Prism Element. Review pe_protection_domains.collection in the raw JSON for the direct and Prism Central proxy API results."),
+    ];
+  }
+  const CW = [1900, 1600, 900, 1700, 1900, 900, 1900];
+  const dataRows = rows.map((p, i) => {
+    const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+    return new TableRow({ cantSplit: true, children: [
+      cell(p.name || "Unnamed", { width: CW[0], shading: bg, bold: true }),
+      cell(p.type || "N/A", { width: CW[1], shading: bg }),
+      cell(p.role || "N/A", { width: CW[2], shading: bg }),
+      cell(p.protected_entities || "N/A", { width: CW[3], shading: bg }),
+      cell(p.remote_sites || "None", { width: CW[4], shading: bg }),
+      cell(String(p.schedule_count ?? 0), { width: CW[5], shading: bg, center: true }),
+      cell(p.state || "Configured", {
+        width: CW[6], shading: bg, bold: true,
+        color: STATUS_COLORS[p.status] || "000000",
+      }),
+    ]});
+  });
+  const table = new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [
+        hdrCell("Protection Domain", CW[0]),
+        hdrCell("Type", CW[1]),
+        hdrCell("Role", CW[2]),
+        hdrCell("Protected Entities", CW[3]),
+        hdrCell("Remote Sites", CW[4]),
+        hdrCell("Schedules", CW[5]),
+        hdrCell("State", CW[6]),
+      ]}),
+      ...dataRows,
+    ],
+  });
+  return [heading2("PE Protection Domain Summary"), table];
+}
+
+function peRemoteSiteSection() {
+  const rows = Array.isArray(D.protection.pe_remote_sites) ? D.protection.pe_remote_sites : [];
+  const collectionSucceeded = D.protection.pe_remote_site_collection_successful === true;
+  if (!rows.length && collectionSucceeded) return [];
+  if (!rows.length) {
+    return [
+      heading2("PE Remote Sites"),
+      body("Remote Site inventory could not be collected from Prism Element. Review pe_remote_sites.collection in the raw JSON for API details."),
+    ];
+  }
+  const CW = [2100, 1400, 2600, 1500, 1700, 1500];
+  return [
+    heading2("PE Remote Sites"),
+    new Table({
+      layout: TableLayoutType.AUTOFIT,
+      width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+      columnWidths: CW,
+      rows: [
+        new TableRow({ tableHeader: true, cantSplit: true, children: [
+          hdrCell("Remote Site", CW[0]),
+          hdrCell("Type", CW[1]),
+          hdrCell("Address", CW[2]),
+          hdrCell("Compression", CW[3]),
+          hdrCell("Bandwidth Policy", CW[4]),
+          hdrCell("State", CW[5]),
+        ]}),
+        ...rows.map((s, i) => {
+          const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+          return new TableRow({ cantSplit: true, children: [
+            cell(s.name || "Unnamed", { width: CW[0], shading: bg, bold: true }),
+            cell(s.type || "N/A", { width: CW[1], shading: bg }),
+            cell(s.addresses || "N/A", { width: CW[2], shading: bg }),
+            cell(s.compression || "N/A", { width: CW[3], shading: bg }),
+            cell(s.bandwidth_policy || "N/A", { width: CW[4], shading: bg }),
+            cell(s.state || "Configured", { width: CW[5], shading: bg }),
+          ]});
+        }),
+      ],
+    }),
+  ];
+}
+
 function recoveryPlanSummaryTable() {
   const rows = Array.isArray(D.protection.recovery_plans) ? D.protection.recovery_plans : [];
-  const CW = [1250, 1050, 1050, 600, 700, 1700, 1500, 1500, 1450];
+  const CW = [1400, 1100, 1100, 650, 750, 1900, 1900, 2000];
   const dataRows = rows.length ? rows.map((p, i) => {
     const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
     return new TableRow({ cantSplit: true, children: [
@@ -5708,17 +6299,20 @@ function recoveryPlanSummaryTable() {
       cell(p.last_validation_status || "Not Run", { width: CW[5], shading: bg }),
       cell(p.last_test_status || "Not Run", { width: CW[6], shading: bg }),
       cell(p.last_failover_status || "Not Run", { width: CW[7], shading: bg }),
-      securityStatusCell(p.status, CW[8], bg),
     ]});
   }) : [new TableRow({ cantSplit: true, children: [
     cell("N/A", { width: CW[0], bold: true }),
     cell("No Recovery Plans configured", { width: CW[1] + CW[2] + CW[3] + CW[4] + CW[5] + CW[6] + CW[7] }),
-    securityStatusCell("N/A", CW[8], "FFFFFF"),
   ]})];
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
-    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Recovery Plan", CW[0]), hdrCell("Primary", CW[1]), hdrCell("Recovery", CW[2]), hdrCell("Stages", CW[3]), hdrCell("Mappings", CW[4]), hdrCell("Last Validation Status", CW[5]), hdrCell("Last Test Status", CW[6]), hdrCell("Last Failover Status", CW[7]), hdrCell("Status", CW[8])] }),
+    new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Recovery Plan", CW[0]), hdrCell("Primary", CW[1]), hdrCell("Recovery", CW[2]), hdrCell("Stages", CW[3]), hdrCell("Mappings", CW[4]), hdrCell("Last Validation Status", CW[5]), hdrCell("Last Test Status", CW[6]), hdrCell("Last Failover Status", CW[7])] }),
     ...dataRows,
   ]});
+}
+
+function recoveryPlanSection() {
+  const rows = Array.isArray(D.protection.recovery_plans) ? D.protection.recovery_plans : [];
+  return rows.length ? [heading2("PC Recovery Plan Summary"), recoveryPlanSummaryTable()] : [];
 }
 
 function ngtSummaryTable() {
@@ -5981,14 +6575,17 @@ const children = [
     `• Applicable Protection Policies: ${D.protection.policy_count || 0}\n` +
     `• Applicable Replication Schedules: ${D.protection.schedule_count || 0}\n` +
     `• Paused Replication Schedules: ${D.protection.paused_schedule_count || 0}\n` +
+    `• Prism Element Protection Domains: ${D.protection.pe_protection_domain_collection_successful === true ? (D.protection.pe_protection_domain_count || 0) : "Not available"}\n` +
+    `• Prism Element Remote Sites: ${D.protection.pe_remote_site_collection_successful === true ? (D.protection.pe_remote_site_count || 0) : "Not available"}\n` +
+    `• Active Data Protection Alerts: ${D.protection.data_protection_alert_count || 0}\n` +
     `• Recovery Plans: ${D.protection.recovery_plan_count || 0}`,
     D.protection.recommendations),
-  heading2("Protection Policy Summary"),
-  protectionPolicySummaryTable(),
-  heading2("Replication Schedule Summary"),
-  protectionScheduleSummaryTable(),
-  heading2("Recovery Plan Summary"),
-  recoveryPlanSummaryTable(),
+  ...dataProtectionAlertSection(),
+  ...peProtectionDomainSection(),
+  ...peRemoteSiteSection(),
+  ...protectionPolicySection(),
+  ...protectionScheduleSection(),
+  ...recoveryPlanSection(),
   pageBreak(),
 
   // CPU
