@@ -3209,6 +3209,8 @@ class HealthAnalyser:
             data_protection_alert_rows.append({
                 "title": title,
                 "severity": severity.title(),
+                "source_host": alert.get("sourceHost") or alert.get("sourceEntity") or "N/A",
+                "last_occurred": alert.get("lastOccurred") or alert.get("creationTime", ""),
                 "details": message or "N/A",
                 "recommendation": str(
                     alert.get("recommendedResolution")
@@ -5433,7 +5435,6 @@ const SECTION_BOOKMARKS = {
   "Licensing Summary": "sec_licensing",
   "Security Summary": "sec_security",
   "Software Lifecycle Summary": "sec_software_lifecycle",
-  "NCC Health Checks Summary": "sec_ncc_health_checks",
 };
 
 function statusRun(status) {
@@ -5527,9 +5528,8 @@ function twoColTable(rows, widths = [3600, 7200]) {
   });
 }
 
-function sectionTable(label, status, observation, recommendations) {
+function sectionTable(label, status, observation) {
   const obsLines = String(observation || "").split("\n").filter(l => l.trim());
-  const recArray = Array.isArray(recommendations) ? recommendations : [recommendations];
 
   const mkPara = (text, bullet = false, bold = false) => {
     const cleanText = String(text || "").replace(/^[•\-]\s*/, "");
@@ -5557,10 +5557,6 @@ function sectionTable(label, status, observation, recommendations) {
     ? obsLines.map(l => mkPara(l.replace(/^•\s*/, ""), l.trim().startsWith("•")))
     : [mkPara("No observations recorded.")];
 
-  const recParas = recArray.filter(r => String(r || "").trim()).length
-    ? recArray.filter(r => String(r || "").trim()).map(r => mkPara(r, true))
-    : [mkPara("No immediate action required.", true)];
-
   return new Table({
     layout: TableLayoutType.AUTOFIT,
     width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [2300, 8500],
@@ -5578,14 +5574,48 @@ function sectionTable(label, status, observation, recommendations) {
           children: obsParas,
         }),
       ]}),
-      new TableRow({ cantSplit: true, children: [
-        cell("Recommendations", { width: 2300, shading: NUTANIX_LIGHT, bold: true }),
-        new TableCell({ borders: BORDERS, margins: { top: 60, bottom: 60, left: 120, right: 120 }, width: { size: 8500, type: WidthType.DXA },
-          children: recParas,
-        }),
-      ]}),
     ],
   });
+}
+
+function sectionRecommendedActions(recommendations, status) {
+  let items = (Array.isArray(recommendations) ? recommendations : [recommendations])
+    .map(item => String(item || "").trim())
+    .filter(Boolean);
+
+  // A generic no-action placeholder is appropriate only for a Healthy section.
+  // If the section has findings, replace it with an actionable fallback so the
+  // priority and recommendation do not contradict each other.
+  if (status !== "Healthy") {
+    items = items.filter(item => !/^no immediate action required\.?$/i.test(item));
+  }
+  const actions = items.length ? items : [
+    status === "Critical"
+      ? "Review and remediate the critical findings identified in this section."
+      : status === "Recommended"
+      ? "Review the findings identified in this section during the next maintenance window."
+      : "No immediate action required. Continue routine monitoring.",
+  ];
+  const priority = status === "Critical" ? "High" : status === "Recommended" ? "Medium" : "Low";
+  const priorityFill = priority === "High" ? "FCE8E6" : priority === "Medium" ? "FFF4CC" : "E6F4EA";
+  const CW = [1800, 9000];
+  return [
+    heading2("Recommended Actions"),
+    new Table({
+      layout: TableLayoutType.AUTOFIT,
+      width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+      columnWidths: CW,
+      rows: [
+        new TableRow({ tableHeader: true, cantSplit: true, children: [
+          hdrCell("Priority", CW[0]), hdrCell("Recommended Action", CW[1]),
+        ]}),
+        ...actions.map((action, i) => new TableRow({ cantSplit: true, children: [
+          cell(priority, { width: CW[0], shading: priorityFill, bold: true }),
+          cell(action, { width: CW[1], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
+        ]})),
+      ],
+    }),
+  ];
 }
 
 const D = DATA;
@@ -5594,15 +5624,14 @@ const C = D.cluster;
 const summaryStatuses = [
   ["Alerts Summary",               D.health.status],
   ["Virtual Machines Summary",     D.vms.status],
-  ["Data Protection Summary",      D.protection.status],
   ["Cluster CPU Summary",  D.cpu.status],
   ["Cluster Memory Summary", D.memory.status],
-  ["Network Summary",              D.network.status],
   ["Cluster Storage Summary", D.storage.status],
+  ["Network Summary",              D.network.status],
+  ["Data Protection Summary",      D.protection.status],
   ["Licensing Summary",            D.licensing.status],
   ["Security Summary", D.security.status],
   ["Software Lifecycle Summary", D.software_lifecycle.status],
-  ["NCC Health Checks Summary",    D.ncc.status],
 ];
 
 
@@ -6648,7 +6677,7 @@ function recommendedActions() {
   }
 
   if (out.length === 0) {
-    out.push({ priority: "Low", recommendation: "No immediate alert remediation required. Continue routine monitoring and scheduled NCC reviews.", reason: "No active alert findings were detected." });
+    out.push({ priority: "Low", recommendation: "No immediate alert remediation required. Continue routine monitoring and scheduled health reviews.", reason: "No active alert findings were detected." });
   }
 
   return out
@@ -6708,34 +6737,9 @@ function protectionScheduleSummaryTable() {
 function dataProtectionAlertSection() {
   const rows = Array.isArray(D.protection.data_protection_alerts) ? D.protection.data_protection_alerts : [];
   if (!rows.length) return [];
-  const CW = [2300, 1200, 3700, 3600];
   return [
     heading2("Active Data Protection Alerts"),
-    new Table({
-      layout: TableLayoutType.AUTOFIT,
-      width: { size: CONTENT_WIDTH, type: WidthType.DXA },
-      columnWidths: CW,
-      rows: [
-        new TableRow({ tableHeader: true, cantSplit: true, children: [
-          hdrCell("Alert", CW[0]),
-          hdrCell("Severity", CW[1]),
-          hdrCell("Details", CW[2]),
-          hdrCell("Recommended Action", CW[3]),
-        ]}),
-        ...rows.map((a, i) => {
-          const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
-          return new TableRow({ cantSplit: true, children: [
-            cell(a.title || "Alert", { width: CW[0], shading: bg, bold: true }),
-            cell(a.severity || "Info", {
-              width: CW[1], shading: bg, bold: true,
-              color: STATUS_COLORS[a.status] || "000000",
-            }),
-            cell(a.details || "N/A", { width: CW[2], shading: bg }),
-            cell(a.recommendation || "Review in Prism Central.", { width: CW[3], shading: bg }),
-          ]});
-        }),
-      ],
-    }),
+    correlatedAlertTable(rows),
   ];
 }
 
@@ -7115,29 +7119,11 @@ const children = [
     "\n• Unsupported Guest OS: " + ((D.vms.os_unsupported || []).length) +
     "\n• Nutanix System VMs Ignored: " + ((D.vms.system_vm_ignored || []).length),
     D.vms.recommendations),
+  ...sectionRecommendedActions(D.vms.recommendations, D.vms.status),
   heading2("NGT Summary"),
   ngtSummaryTable(),
   ...vmDetailTable(),
   ...cvmTable(),
-  pageBreak(),
-
-  // DATA PROTECTION
-  heading1("Data Protection Summary"),
-  sectionTable("Data Protection", D.protection.status,
-    `• Applicable Protection Policies: ${D.protection.policy_count || 0}\n` +
-    `• Applicable Replication Schedules: ${D.protection.schedule_count || 0}\n` +
-    `• Paused Replication Schedules: ${D.protection.paused_schedule_count || 0}\n` +
-    `• Prism Element Protection Domains: ${D.protection.pe_protection_domain_collection_successful === true ? (D.protection.pe_protection_domain_count || 0) : "Not available"}\n` +
-    `• Prism Element Remote Sites: ${D.protection.pe_remote_site_collection_successful === true ? (D.protection.pe_remote_site_count || 0) : "Not available"}\n` +
-    `• Active Data Protection Alerts: ${D.protection.data_protection_alert_count || 0}\n` +
-    `• Recovery Plans: ${D.protection.recovery_plan_count || 0}`,
-    D.protection.recommendations),
-  ...dataProtectionAlertSection(),
-  ...peProtectionDomainSection(),
-  ...peRemoteSiteSection(),
-  ...protectionPolicySection(),
-  ...protectionScheduleSection(),
-  ...recoveryPlanSection(),
   pageBreak(),
 
   // CPU
@@ -7148,6 +7134,7 @@ const children = [
     `• Available CPU Headroom: ${pct2(D.cpu.cpu_headroom_pct)}\n` +
     `• Cluster vCPU:pCore Ratio: ${D.cpu.vcpu_pcore_ratio || "N/A"}`,
     D.cpu.recommendations),
+  ...sectionRecommendedActions(D.cpu.recommendations, D.cpu.status),
   ...cpuChart(D.cpu.cpu_history),
   heading2("CPU Allocation by Host"),
   cpuDistributionTable(),
@@ -7171,6 +7158,7 @@ const children = [
     `• Memory Allocation Percentage: ${D.memory.memory_allocation_pct || "N/A"}` +
     ((D.memory.memory_alert_count || 0) > 0 ? `\n• Active Memory Alerts: ${D.memory.memory_alert_count}` : ""),
     D.memory.recommendations),
+  ...sectionRecommendedActions(D.memory.recommendations, D.memory.status),
   ...(((D.memory.memory_alerts || []).length > 0) ? [heading2("Active Memory Alerts"), correlatedAlertTable(D.memory.memory_alerts)] : []),
   ...memChart(D.memory.mem_history),
   heading2("Memory Allocation by Host"),
@@ -7189,6 +7177,7 @@ const children = [
     `• Disk Utilization: ${D.storage.disk_utilization_pct !== "N/A" ? D.storage.disk_utilization_pct + "%" : "Not available via stats API"}\n• Storage Pool Capacity: ${D.storage.pool_capacity_tib ? D.storage.pool_capacity_tib + " TiB" : "N/A"}\n• User Storage Containers: ${D.storage.container_count}` +
     ((D.storage.storage_alert_count || 0) > 0 ? `\n• Active Storage Alerts: ${D.storage.storage_alert_count}` : ""),
     D.storage.recommendations),
+  ...sectionRecommendedActions(D.storage.recommendations, D.storage.status),
   ...(((D.storage.storage_alerts || []).length > 0) ? [heading2("Active Storage Alerts"), correlatedAlertTable(D.storage.storage_alerts)] : []),
   heading2("Storage Health Summary"),
   diskHealthSummaryTable(),
@@ -7207,6 +7196,7 @@ const children = [
     `• Physical NICs: ${D.network.nic_count || 0}\n` +
     ((D.network.network_alert_count || 0) > 0 ? `• Active Network Alerts: ${D.network.network_alert_count}` : `• Active Network Alerts: 0`),
     D.network.recommendations),
+  ...sectionRecommendedActions(D.network.recommendations, D.network.status),
   ...(((D.network.network_alerts || []).length > 0) ? [heading2("Active Network Alerts"), correlatedAlertTable(D.network.network_alerts)] : []),
   heading2("Network Health Summary"),
   networkHealthSummaryTable(),
@@ -7224,11 +7214,31 @@ const children = [
   dnsNtpSummaryTable(),
   pageBreak(),
 
+  // DATA PROTECTION
+  heading1("Data Protection Summary"),
+  sectionTable("Data Protection", D.protection.status,
+    `• Applicable Protection Policies: ${D.protection.policy_count || 0}\n` +
+    `• Applicable Replication Schedules: ${D.protection.schedule_count || 0}\n` +
+    `• Paused Replication Schedules: ${D.protection.paused_schedule_count || 0}\n` +
+    `• Prism Element Protection Domains: ${D.protection.pe_protection_domain_collection_successful === true ? (D.protection.pe_protection_domain_count || 0) : "Not available"}\n` +
+    `• Prism Element Remote Sites: ${D.protection.pe_remote_site_collection_successful === true ? (D.protection.pe_remote_site_count || 0) : "Not available"}\n` +
+    `• Active Data Protection Alerts: ${D.protection.data_protection_alert_count || 0}\n` +
+    `• Recovery Plans: ${D.protection.recovery_plan_count || 0}`),
+  ...sectionRecommendedActions(D.protection.recommendations, D.protection.status),
+  ...dataProtectionAlertSection(),
+  ...peProtectionDomainSection(),
+  ...peRemoteSiteSection(),
+  ...protectionPolicySection(),
+  ...protectionScheduleSection(),
+  ...recoveryPlanSection(),
+  pageBreak(),
+
   // LICENSING
   heading1("Licensing Summary"),
   sectionTable("Licensing", D.licensing.status,
     `• License: ${D.licensing.license_name} (${D.licensing.license_type})\n• Support/License Expiry: ${D.licensing.expiry_date}\n• Violations: ${D.licensing.violations.length === 0 ? "None" : D.licensing.violations.join(", ")}`,
     D.licensing.recommendations),
+  ...sectionRecommendedActions(D.licensing.recommendations, D.licensing.status),
   pageBreak(),
 
   // SECURITY
@@ -7243,6 +7253,7 @@ const children = [
     `• Active Security Alerts: ${D.security.security_alert_count || 0}\n` +
     `• Critical Security Alerts: ${D.security.critical_security_alert_count || 0}`,
     D.security.recommendations),
+  ...sectionRecommendedActions(D.security.recommendations, D.security.status),
   ...(((D.security.security_alerts || []).length > 0) ? [heading2("Active Security Alerts"), correlatedAlertTable(D.security.security_alerts)] : []),
   heading2("Security Configuration Summary"),
   securityConfigurationSummaryTable(),
@@ -7270,6 +7281,7 @@ const children = [
     (!D.software_lifecycle.ahv_consistent ? `• AHV Version Consistency: Inconsistent / Unknown\n` : "") +
     `• Firmware Upgrade Recommendations: ${D.software_lifecycle.firmware_recommendations_collected ? (D.software_lifecycle.firmware_updates || []).length : "N/A"}`,
     D.software_lifecycle.recommendations),
+  ...sectionRecommendedActions(D.software_lifecycle.recommendations, D.software_lifecycle.status),
   heading2("Cluster Software Inventory"),
   softwareInventoryTable(),
   heading2("AOS Lifecycle Summary"),
@@ -7281,24 +7293,6 @@ const children = [
   heading2("Available Firmware Upgrades"),
   firmwareUpgradeTable(),
   pageBreak(),
-
-  // NCC
-  heading1("NCC Health Checks Summary"),
-  sectionTable("NCC", D.ncc.status, `• NCC checks requiring review: ${D.ncc.check_count}`, D.ncc.recommendations),
-  ...(D.ncc.checks.length > 0 ? [
-    heading2("NCC Check Details"),
-    new Table({
-    layout: TableLayoutType.AUTOFIT,
-      width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [8800, 2000],
-      rows: [
-        new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Check", 8800), hdrCell("Severity", 2000)] }),
-        ...D.ncc.checks.map((ch, i) => new TableRow({ cantSplit: true, children: [
-          cell(ch.title,    { width: 8800, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
-          cell(ch.severity, { width: 2000, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
-        ]})),
-      ],
-    }),
-  ] : []),
 ];
 
 const doc = new Document({
