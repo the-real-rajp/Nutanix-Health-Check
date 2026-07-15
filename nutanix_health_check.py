@@ -30,7 +30,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib3
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -118,6 +120,18 @@ def _aos_minor_version(value: str) -> str:
     return m.group(1) if m else str(value or "").strip()
 
 
+def _legacy_aos_release_type(value: str) -> str:
+    """Return the legacy LTS/STS classification for pre-6.10 AOS trains."""
+    train = _aos_minor_version(value)
+    version = _version_tuple(train)
+    if not version or version >= (6, 10):
+        return ""
+    # The legacy model used designated LTS trains; other pre-6.10 trains
+    # were STS (including releases whose support was later extended).
+    lts_trains = {"5.5", "5.10", "5.15", "5.20", "6.5"}
+    return "LTS" if train in lts_trains else "STS"
+
+
 def _normalise_os_name(value: str) -> str:
     """Normalise OS names for compatibility-matrix matching."""
     s = str(value or "").strip().lower()
@@ -194,6 +208,8 @@ def _load_aos_eol_info(path: str, aos_version: str) -> dict:
         "current_version": aos_version or "N/A",
         "matched_version": "N/A",
         "latest_version": "N/A",
+        "within_n_minus_one": False,
+        "legacy_release_type": _legacy_aos_release_type(aos_version),
         "end_of_maintenance": "N/A",
         "end_of_support_life": "N/A",
         "lifecycle_status": "Unknown",
@@ -243,6 +259,22 @@ def _load_aos_eol_info(path: str, aos_version: str) -> dict:
         if not latest and train:
             versions = [e["version"] for e in train if e.get("version")]
             latest = sorted(versions, key=_version_tuple)[-1] if versions else "N/A"
+        # Accept both the newest patch (N) and the immediately preceding
+        # supported patch (N-1). Exclude train-level rows such as "7.5"
+        # when ranking patch releases.
+        patch_versions = sorted(
+            {
+                e["version"]
+                for e in train
+                if e.get("version") and len(_version_tuple(e["version"])) >= 3
+            },
+            key=_version_tuple,
+            reverse=True,
+        )
+        if latest and latest != "N/A" and latest not in patch_versions:
+            patch_versions.insert(0, latest)
+        n_minus_one = patch_versions[1] if len(patch_versions) > 1 else "N/A"
+        within_n_minus_one = current in {latest, n_minus_one}
         eom_dt = _parse_iso_date(match.get("eom", ""))
         eos_dt = _parse_iso_date(match.get("eos", ""))
         now = datetime.now(timezone.utc)
@@ -252,8 +284,11 @@ def _load_aos_eol_info(path: str, aos_version: str) -> dict:
         elif eom_dt and now > eom_dt:
             lifecycle = "Past End of Maintenance"
             report_status = "Recommended"
+        elif within_n_minus_one:
+            lifecycle = "Supported"
+            report_status = "Healthy"
         elif latest and latest != "N/A" and _version_tuple(current) < _version_tuple(latest):
-            lifecycle = "Supported - update available"
+            lifecycle = "Supported - update recommended"
             report_status = "Recommended"
         else:
             lifecycle = "Supported"
@@ -261,6 +296,8 @@ def _load_aos_eol_info(path: str, aos_version: str) -> dict:
         result.update({
             "matched_version": match.get("version") or "N/A",
             "latest_version": latest or "N/A",
+            "within_n_minus_one": within_n_minus_one,
+            "legacy_release_type": _legacy_aos_release_type(current),
             "end_of_maintenance": (eom_dt.date().isoformat() if eom_dt else "N/A"),
             "end_of_support_life": (eos_dt.date().isoformat() if eos_dt else "N/A"),
             "lifecycle_status": lifecycle,
@@ -375,11 +412,14 @@ class PrismCentralClient:
         last_resp.raise_for_status()
         return last_resp.json()
 
-    def post(self, path: str, body: Optional[dict] = None, params: Optional[dict] = None) -> Any:
+    def post(self, path: str, body: Optional[dict] = None, params: Optional[dict] = None,
+             headers: Optional[dict] = None) -> Any:
         url  = f"{self.base}{path}"
         last_resp = None
         for attempt in range(3):
-            resp = self.session.post(url, json=(body or {}), params=params, timeout=60)
+            resp = self.session.post(
+                url, json=(body or {}), params=params, headers=headers, timeout=60
+            )
             last_resp = resp
             if resp.status_code == 429 and attempt < 2:
                 time.sleep(2 + attempt * 3)
@@ -520,6 +560,8 @@ class ClusterDataCollector:
             ("virtual_machines",    self._virtual_machines),    # collect before ahv_version
             ("cvm_virtual_machines", self._cvm_virtual_machines), # optional PE CVM VM details
             ("ahv_version",         self._ahv_version),         # uses VM host UUIDs as fallback
+            ("lcm_entities",        self._lcm_entities),        # current software/firmware inventory
+            ("lcm_firmware_recommendations", self._lcm_firmware_recommendations),
             ("alerts",              self._alerts),
             ("protection_policies", self._protection_policies),
             ("recovery_plans",      self._recovery_plans),
@@ -2026,6 +2068,179 @@ class ClusterDataCollector:
             except Exception:
                 continue
         return None
+
+    def _lcm_entities(self):
+        """Collect the current read-only LCM entity inventory for this cluster."""
+        cluster_filter = f"clusterExtId eq '{self.cluster_ext_id}'"
+        for ver in ["v4.2", "v4.1", "v4.0"]:
+            path = f"/lifecycle/{ver}/resources/entities"
+            try:
+                result = self.client.get(
+                    path,
+                    params={"$limit": 100, "$filter": cluster_filter},
+                )
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                # Some early lifecycle builds reject the cluster filter. Fall
+                # back to a single read-only page and scope it locally.
+                try:
+                    result = self.client.get(path, params={"$limit": 100})
+                    if isinstance(result, dict):
+                        items = result.get("data", [])
+                        if isinstance(items, list):
+                            result["data"] = [
+                                item for item in items
+                                if str(item.get("clusterExtId") or "") == self.cluster_ext_id
+                            ]
+                        return result
+                except Exception:
+                    continue
+        return None
+
+    def _lcm_firmware_recommendations(self):
+        """Calculate and retrieve read-only LCM firmware recommendations.
+
+        This starts only the LCM recommendation calculation. It does not run
+        inventory, prechecks, downloads, staging, or installation.
+        """
+        compute = self.client.post(
+            "/lifecycle/v4.2/operations/$actions/compute-recommendations",
+            body={"recommendationSpec": ["FIRMWARE"]},
+            headers={
+                "NTNX-Request-Id": str(uuid.uuid4()),
+                "X-Cluster-Id": self.cluster_ext_id,
+            },
+        )
+        task_ref = ((compute or {}).get("data") or {}).get("extId")
+        if not task_ref:
+            return {
+                "_collected": False,
+                "_error": "LCM did not return a recommendation task reference.",
+                "_compute": compute,
+            }
+
+        # Prism task references can be either a UUID or a provider-prefixed
+        # value such as "ZXJnb24=:<uuid>". The v3 task API expects the UUID.
+        task_uuid_match = re.search(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            str(task_ref),
+        )
+        task_uuid = task_uuid_match.group(0) if task_uuid_match else str(task_ref)
+        task = None
+        terminal_status = ""
+        for _ in range(30):
+            task = self.client.get(f"/nutanix/v3/tasks/{task_uuid}")
+            terminal_status = str((task or {}).get("status") or "").upper()
+            if terminal_status in {"SUCCEEDED", "SUCCESS", "COMPLETE", "COMPLETED"}:
+                break
+            if terminal_status in {"FAILED", "FAILURE", "ABORTED", "CANCELLED"}:
+                return {
+                    "_collected": False,
+                    "_error": (task or {}).get("error_detail") or "LCM recommendation calculation failed.",
+                    "_compute": compute,
+                    "_task": task,
+                }
+            time.sleep(1)
+        else:
+            return {
+                "_collected": False,
+                "_error": "Timed out waiting for the LCM recommendation calculation.",
+                "_compute": compute,
+                "_task": task,
+            }
+
+        completion = (
+            (task or {}).get("completion_details")
+            or (task or {}).get("completionDetails")
+            or (task or {}).get("response")
+            or {}
+        )
+
+        recommendation_id = None
+
+        def walk(value, key_hint=""):
+            nonlocal recommendation_id
+            if recommendation_id:
+                return
+            if isinstance(value, dict):
+                label = " ".join(
+                    str(value.get(key) or "")
+                    for key in ("name", "key", "type", "kind", "rel")
+                ).lower()
+                if "recommend" in label or "resource" in label:
+                    uuid_match = re.search(
+                        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                        json.dumps(value, default=str),
+                    )
+                    if uuid_match:
+                        recommendation_id = uuid_match.group(0)
+                        return
+                for key, child in value.items():
+                    walk(child, str(key))
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child, key_hint)
+            elif isinstance(value, str):
+                path_match = re.search(
+                    r"/recommendations/([0-9a-fA-F-]{36})", value
+                )
+                if path_match:
+                    recommendation_id = path_match.group(1)
+                    return
+                if "recommend" in key_hint.lower() or "resource" in key_hint.lower():
+                    uuid_match = re.search(
+                        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                        value,
+                    )
+                    if uuid_match:
+                        recommendation_id = uuid_match.group(0)
+
+        walk(completion)
+        if not recommendation_id:
+            # Completion details belong solely to this recommendation task;
+            # use their first UUID as a compatibility fallback for releases
+            # that return an unlabeled name/value pair.
+            uuid_match = re.search(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                json.dumps(completion, default=str),
+            )
+            if uuid_match:
+                recommendation_id = uuid_match.group(0)
+        if not recommendation_id:
+            # Some releases store the resource reference elsewhere in the
+            # completed task, so perform the same key-aware search once across
+            # the full task response.
+            walk(task or {})
+
+        if not recommendation_id:
+            return {
+                "_collected": False,
+                "_error": "LCM task completed but did not expose a recommendation resource ID.",
+                "_compute": compute,
+                "_task": task,
+            }
+
+        last_error = None
+        for ver in ["v4.2", "v4.1", "v4.0"]:
+            try:
+                result = self.client.get(
+                    f"/lifecycle/{ver}/resources/recommendations/{recommendation_id}"
+                )
+                if isinstance(result, dict):
+                    result["_collected"] = True
+                    result["_recommendation_id"] = recommendation_id
+                    result["_task"] = task
+                    return result
+            except Exception as exc:
+                last_error = exc
+        return {
+            "_collected": False,
+            "_error": f"Unable to retrieve LCM recommendation resource: {last_error}",
+            "_compute": compute,
+            "_task": task,
+            "_recommendation_id": recommendation_id,
+        }
 
     def _ncc_checks(self):
         try:
@@ -4627,15 +4842,8 @@ class HealthAnalyser:
             pe_cluster = pe_cluster["data"]
         if not isinstance(pe_cluster, dict):
             pe_cluster = {}
-        cvm_security = pe_cluster.get("security_compliance_config") or {}
-        ahv_security = pe_cluster.get("hypervisor_security_compliance_config") or {}
-
         def _first_known(*values):
             return next((value for value in values if value is not None), None)
-
-        def _combined_bool(*values):
-            known = [value for value in values if isinstance(value, bool)]
-            return (all(known) if known else None)
 
         def _bool_text(value):
             return "Enabled" if value is True else ("Disabled" if value is False else "N/A")
@@ -4705,24 +4913,12 @@ class HealthAnalyser:
             secure_boot_status = "N/A"
         secure_boot_enabled_count = sum(1 for v in secure_boot_eligible_values if bool(v))
 
-        pc_full_config = pc_security.get("securityConfig") or pc_security.get("securityConfiguration") or {}
-        if not isinstance(pc_full_config, dict):
-            pc_full_config = {}
         cluster_lockdown = _first_known(
             pc_config_summary.get("isClusterLockdownEnabled"),
             pe_cluster.get("enable_lock_down"),
             pe_cluster.get("enableLockDown"),
         )
         log_forwarding = pc_config_summary.get("isLogForwardingEnabled")
-        defense_banner = _first_known(
-            pc_config_summary.get("isConsentBannerEnabled"),
-            pc_full_config.get("isClusterDefenseConsentBannerEnabled"),
-            pc_full_config.get("isAhvDefenseConsentBannerEnabled"),
-            _combined_bool(
-                cvm_security.get("enable_banner"),
-                ahv_security.get("enable_banner"),
-            ),
-        )
         network_segmentation = (
             ((c.get("network") or {}).get("backplane") or {}).get("isSegmentationEnabled")
             if isinstance(c, dict) else None
@@ -4873,11 +5069,6 @@ class HealthAnalyser:
                 "value": _bool_text(log_forwarding),
                 "status": _hardening_status(log_forwarding),
             },
-            {
-                "item": "Defense Consent Banner",
-                "value": _bool_text(defense_banner),
-                "status": _hardening_status(defense_banner),
-            },
         ]
 
         return {
@@ -4918,31 +5109,237 @@ class HealthAnalyser:
     def analyse_software_lifecycle(self) -> dict:
         """Assess AOS lifecycle and software/firmware upgrade planning."""
         c = self._cluster_first()
-        bi = c.get("config", {}).get("buildInfo", {})
+        cfg = c.get("config", {})
+        bi = cfg.get("buildInfo", {})
         full_ver = bi.get("fullVersion", "")
         m = re.search(r"(\d+\.\d+\.\d+\.\d+)", full_ver)
         aos = m.group(1) if m else bi.get("version", "N/A")
         aos_lifecycle = _load_aos_eol_info(self.aos_eol_csv, aos)
-        status = aos_lifecycle.get("report_status", self.STATUS_RECOMMENDED)
+        aos_status = aos_lifecycle.get("report_status", self.STATUS_RECOMMENDED)
+        status = aos_status
+
+        # Cluster software inventory is already present in the collected
+        # Cluster Management and host responses.  Keep lifecycle evaluation
+        # limited to AOS until an authoritative matrix/API is collected for
+        # AHV and NCC.
+        ncc_version = "N/A"
+        for entry in cfg.get("clusterSoftwareMap", []) or []:
+            if str(entry.get("softwareType", "")).upper() == "NCC":
+                ncc_version = str(entry.get("version") or "N/A").replace("ncc-", "")
+                break
+
+        nodes = self._safe_list("nodes")
+        host_versions = []
+        observed_ahv_versions = set()
+        for node in nodes:
+            hypervisor = node.get("hypervisor", {}) or {}
+            full_name = hypervisor.get("fullName") or node.get("hypervisorFullName") or "N/A"
+            version_match = re.search(r"(\d+\.\d+(?:\.\d+){0,3})", str(full_name))
+            ahv_version = version_match.group(1) if version_match else str(full_name)
+            if ahv_version not in ("", "N/A", "None"):
+                observed_ahv_versions.add(ahv_version)
+            connection_state = (
+                hypervisor.get("acropolisConnectionState")
+                or hypervisor.get("state")
+                or "N/A"
+            )
+            host_versions.append({
+                "host": node.get("hostName") or node.get("name") or "N/A",
+                "ahv_version": ahv_version,
+                "connection_state": str(connection_state).replace("ACROPOLIS_", "").title(),
+            })
+
+        cluster_ahv = self.raw.get("ahv_version") or (
+            sorted(observed_ahv_versions)[0] if len(observed_ahv_versions) == 1 else "N/A"
+        )
+        ahv_consistent = len(observed_ahv_versions) <= 1 and bool(observed_ahv_versions)
+        for row in host_versions:
+            connected = str(row["connection_state"]).upper() in ("CONNECTED", "NORMAL")
+            version_matches = ahv_consistent and row["ahv_version"] not in ("N/A", "")
+            row["consistency"] = "Consistent" if version_matches else "Inconsistent / Unknown"
+            row["status"] = self.STATUS_HEALTHY if connected and version_matches else self.STATUS_CRITICAL
+
+        upgrade_status = str(c.get("upgradeStatus") or "N/A")
+        raw_lcm_entities = self.raw.get("lcm_entities")
+        lcm_entities = self._safe_list("lcm_entities")
+        lcm_inventory_collected = isinstance(raw_lcm_entities, (dict, list))
+
+        firmware_groups = {}
+        for entity in lcm_entities:
+            if str(entity.get("entityType") or "").upper() != "FIRMWARE":
+                continue
+            component = entity.get("entityModel") or entity.get("entityClass") or "Unknown Firmware"
+            version = entity.get("entityVersion") or "N/A"
+            family = entity.get("hardwareFamily") or "N/A"
+            vendor = entity.get("hardwareVendor") or "N/A"
+            key = (str(component), str(version), str(family), str(vendor))
+            firmware_groups[key] = firmware_groups.get(key, 0) + 1
+        firmware_inventory = [
+            {
+                "component": key[0],
+                "current_version": key[1],
+                "hardware_family": key[2],
+                "vendor": key[3],
+                "instances": count,
+            }
+            for key, count in sorted(firmware_groups.items(), key=lambda item: (item[0][0].lower(), item[0][2].lower(), item[0][1]))
+        ]
+
+        firmware_by_id = {
+            str(entity.get("extId")): entity
+            for entity in lcm_entities
+            if entity.get("extId")
+            and str(entity.get("entityType") or "").upper() == "FIRMWARE"
+        }
+        raw_firmware_recommendations = self.raw.get("lcm_firmware_recommendations")
+        firmware_recommendations_collected = (
+            isinstance(raw_firmware_recommendations, dict)
+            and raw_firmware_recommendations.get("_collected") is True
+        )
+        firmware_recommendation_error = (
+            raw_firmware_recommendations.get("_error", "")
+            if isinstance(raw_firmware_recommendations, dict)
+            else ""
+        )
+
+        recommendation_specs = []
+
+        def collect_update_specs(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"entityUpdateSpecs", "entity_update_specs"} and isinstance(child, list):
+                        recommendation_specs.extend(item for item in child if isinstance(item, dict))
+                    else:
+                        collect_update_specs(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_update_specs(child)
+
+        if isinstance(raw_firmware_recommendations, dict):
+            collect_update_specs(raw_firmware_recommendations.get("data", raw_firmware_recommendations))
+
+        firmware_update_groups = {}
+        for spec in recommendation_specs:
+            entity_id = str(
+                spec.get("entityUuid")
+                or spec.get("entityExtId")
+                or spec.get("entityId")
+                or spec.get("extId")
+                or ""
+            )
+            entity = firmware_by_id.get(entity_id, {})
+            target_version = (
+                spec.get("toVersion")
+                or spec.get("targetVersion")
+                or spec.get("version")
+                or spec.get("entityVersion")
+                or "N/A"
+            )
+            component = (
+                entity.get("entityModel")
+                or spec.get("entityModel")
+                or spec.get("entityClass")
+                or spec.get("entityType")
+                or "Firmware Component"
+            )
+            current_version = (
+                entity.get("entityVersion")
+                or spec.get("fromVersion")
+                or spec.get("currentVersion")
+                or "N/A"
+            )
+            vendor = entity.get("hardwareVendor") or spec.get("hardwareVendor") or "N/A"
+            key = (str(component), str(current_version), str(target_version), str(vendor))
+            firmware_update_groups[key] = firmware_update_groups.get(key, 0) + 1
+
+        firmware_updates = [
+            {
+                "component": key[0],
+                "current_version": key[1],
+                "available_version": key[2],
+                "vendor": key[3],
+                "instances": count,
+                "status": self.STATUS_RECOMMENDED,
+            }
+            for key, count in sorted(
+                firmware_update_groups.items(),
+                key=lambda item: (item[0][0].lower(), item[0][1], item[0][2]),
+            )
+        ]
+
+        software_inventory = [
+            {
+                "component": "AOS",
+                "installed_version": aos,
+                "consistency": "Consistent" if aos != "N/A" else "Unknown",
+                "lifecycle_status": aos_lifecycle.get("lifecycle_status", "Unknown"),
+                "status": aos_lifecycle.get("report_status", self.STATUS_RECOMMENDED),
+            },
+            {
+                "component": "AHV",
+                "installed_version": cluster_ahv,
+                "consistency": "Consistent" if ahv_consistent else "Inconsistent / Unknown",
+                "lifecycle_status": "Not evaluated",
+                "status": self.STATUS_HEALTHY if ahv_consistent else self.STATUS_CRITICAL,
+            },
+            {
+                "component": "NCC",
+                "installed_version": ncc_version,
+                "consistency": "Consistent" if ncc_version != "N/A" else "Unknown",
+                "lifecycle_status": "Not evaluated",
+                "status": self.STATUS_HEALTHY if ncc_version != "N/A" else self.STATUS_RECOMMENDED,
+            },
+        ]
+
+        if any(item["status"] == self.STATUS_CRITICAL for item in software_inventory):
+            status = self.STATUS_CRITICAL
+        elif status != self.STATUS_CRITICAL and (
+            any(item["status"] == self.STATUS_RECOMMENDED for item in software_inventory)
+            or not lcm_inventory_collected
+            or bool(firmware_updates)
+            or not firmware_recommendations_collected
+        ):
+            status = self.STATUS_RECOMMENDED
+
         recs = []
         latest = aos_lifecycle.get("latest_version", "N/A")
-        if status == self.STATUS_CRITICAL:
+        if aos_status == self.STATUS_CRITICAL:
             recs.append("Upgrade AOS to a supported release as soon as possible.")
+        elif aos_lifecycle.get("within_n_minus_one"):
+            recs.append("Current AOS release is within the supported lifecycle window.")
         elif latest not in ("", "N/A") and _version_tuple(aos) < _version_tuple(latest):
             recs.append(f"Upgrade AOS from {aos} to {latest} via LCM.")
-        elif status == self.STATUS_HEALTHY:
+        elif aos_status == self.STATUS_HEALTHY:
             recs.append("Current AOS release is within the supported lifecycle window.")
         else:
             recs.append("Review AOS lifecycle status and plan an upgrade during the next maintenance window.")
         recs += [
-            "Upgrade AHV to the version recommended for the selected AOS release.",
-            "Upgrade NCC to the latest supported version.",
-            "Run an LCM inventory and apply supported software and firmware updates.",
+            "Maintain AHV on a version qualified for the selected AOS release.",
+            "Maintain NCC on a version supported by LCM.",
         ]
+        if not lcm_inventory_collected:
+            recs.append("Run an LCM inventory to refresh the current firmware inventory.")
+        if firmware_updates:
+            recs.append(
+                f"Review and schedule {len(firmware_updates)} firmware upgrade recommendation group(s) through LCM."
+            )
+        elif not firmware_recommendations_collected:
+            recs.append("Calculate LCM firmware recommendations and review supported firmware updates.")
         return {
             "status": status,
             "aos_version": aos,
+            "ahv_version": cluster_ahv,
+            "ncc_version": ncc_version,
+            "upgrade_status": upgrade_status.replace("_", " ").title(),
             "aos_lifecycle": aos_lifecycle,
+            "software_inventory": software_inventory,
+            "host_versions": sorted(host_versions, key=lambda row: str(row.get("host", "")).lower()),
+            "ahv_consistent": ahv_consistent,
+            "lcm_inventory_collected": lcm_inventory_collected,
+            "firmware_inventory": firmware_inventory,
+            "firmware_recommendations_collected": firmware_recommendations_collected,
+            "firmware_recommendation_error": firmware_recommendation_error,
+            "firmware_updates": firmware_updates,
             "recommendations": recs,
         }
 
@@ -5515,7 +5912,6 @@ function encryptionSecuritySummaryTable() {
   const rows = [["Encryption Status", D.security.storage_encryption || "N/A"]];
   if (enabled) {
     rows.push(["Encryption Type", D.security.encryption_type || "N/A"]);
-    rows.push(["Key Management", D.security.key_management || "N/A"]);
     if (String(D.security.key_management || "") === "External KMS") {
       rows.push(["External KMS", D.security.external_kms || "N/A"]);
     }
@@ -5537,6 +5933,162 @@ function encryptionSecuritySummaryTable() {
       }),
     ],
   });
+}
+
+function softwareInventoryTable() {
+  const items = Array.isArray(D.software_lifecycle.software_inventory) ? D.software_lifecycle.software_inventory : [];
+  const CW = [3000, 3900, 3900];
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [
+        hdrCell("Component", CW[0]), hdrCell("Installed Version", CW[1]),
+        hdrCell("Consistency", CW[2]),
+      ]}),
+      ...items.map((item, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(item.component || "N/A", { width: CW[0], shading: bg, bold: true }),
+          cell(item.installed_version || "N/A", { width: CW[1], shading: bg }),
+          cell(item.consistency || "N/A", { width: CW[2], shading: bg }),
+        ]});
+      }),
+    ],
+  });
+}
+
+function aosLifecycleSummaryTable() {
+  const lifecycle = D.software_lifecycle.aos_lifecycle || {};
+  const current = D.software_lifecycle.aos_version || "N/A";
+  const latest = lifecycle.latest_version || "N/A";
+  const upgradeStatus = D.software_lifecycle.upgrade_status || "N/A";
+  const rows = [
+    ["Current AOS Version", current],
+    ...(lifecycle.legacy_release_type ? [["Legacy Release Type", lifecycle.legacy_release_type]] : []),
+    ["Latest Version in Lifecycle Data", latest],
+    ["End of Maintenance", lifecycle.end_of_maintenance || "N/A"],
+    ["End of Support Life", lifecycle.end_of_support_life || "N/A"],
+    ["Last Cluster Upgrade", upgradeStatus],
+  ];
+  const CW = [4300, 6500];
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Item", CW[0]), hdrCell("Value", CW[1])] }),
+      ...rows.map((row, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(row[0], { width: CW[0], shading: bg, bold: true }),
+          cell(row[1], { width: CW[1], shading: bg }),
+        ]});
+      }),
+    ],
+  });
+}
+
+function firmwareInventoryTable() {
+  const items = Array.isArray(D.software_lifecycle.firmware_inventory) ? D.software_lifecycle.firmware_inventory : [];
+  if (items.length === 0) {
+    return body(
+      D.software_lifecycle.lcm_inventory_collected
+        ? "LCM inventory was collected, but no firmware entities were returned for this cluster."
+        : "Current firmware inventory was not collected from LCM.",
+      { italic: true }
+    );
+  }
+  const CW = [4700, 2500, 2200, 1400];
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [
+        hdrCell("Component", CW[0]), hdrCell("Current Version", CW[1]),
+        hdrCell("Vendor", CW[2]), hdrCell("Instances", CW[3]),
+      ]}),
+      ...items.map((item, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(item.component || "N/A", { width: CW[0], shading: bg, bold: true }),
+          cell(item.current_version || "N/A", { width: CW[1], shading: bg }),
+          cell(item.vendor || "N/A", { width: CW[2], shading: bg }),
+          cell(item.instances ?? 0, { width: CW[3], shading: bg }),
+        ]});
+      }),
+    ],
+  });
+}
+
+function firmwareUpgradeTable() {
+  const items = Array.isArray(D.software_lifecycle.firmware_updates) ? D.software_lifecycle.firmware_updates : [];
+  if (items.length === 0) {
+    return body(
+      D.software_lifecycle.firmware_recommendations_collected
+        ? "No firmware upgrades were recommended by LCM."
+        : "Firmware upgrade recommendations were not available from LCM for this report.",
+      { italic: true }
+    );
+  }
+  const CW = [2800, 1600, 1700, 1400, 1400, 1900];
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [
+        hdrCell("Component", CW[0]), hdrCell("Current Version", CW[1]),
+        hdrCell("Available Version", CW[2]), hdrCell("Vendor", CW[3]),
+        hdrCell("Instances", CW[4]), hdrCell("Status", CW[5]),
+      ]}),
+      ...items.map((item, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(item.component || "N/A", { width: CW[0], shading: bg, bold: true }),
+          cell(item.current_version || "N/A", { width: CW[1], shading: bg }),
+          cell(item.available_version || "N/A", { width: CW[2], shading: bg }),
+          cell(item.vendor || "N/A", { width: CW[3], shading: bg }),
+          cell(item.instances ?? 0, { width: CW[4], shading: bg, center: true }),
+          securityStatusCell(item.status || "Recommended", CW[5], bg),
+        ]});
+      }),
+    ],
+  });
+}
+
+function ahvHostVersionTable() {
+  const hosts = Array.isArray(D.software_lifecycle.host_versions) ? D.software_lifecycle.host_versions : [];
+  const CW = [3000, 2200, 2200, 1900, 1500];
+  if (hosts.length === 0) return body("AHV host version inventory was not available.", { italic: true });
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [
+        hdrCell("Host", CW[0]), hdrCell("AHV Version", CW[1]),
+        hdrCell("Connection", CW[2]), hdrCell("Consistency", CW[3]), hdrCell("Status", CW[4]),
+      ]}),
+      ...hosts.map((host, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(host.host || "N/A", { width: CW[0], shading: bg, bold: true }),
+          cell(host.ahv_version || "N/A", { width: CW[1], shading: bg }),
+          cell(host.connection_state || "N/A", { width: CW[2], shading: bg }),
+          cell(host.consistency || "N/A", { width: CW[3], shading: bg }),
+          securityStatusCell(host.status, CW[4], bg),
+        ]});
+      }),
+    ],
+  });
+}
+
+function ahvHostVersionSection() {
+  if (D.software_lifecycle.ahv_consistent) return [];
+  return [heading2("AHV Version by Host"), ahvHostVersionTable()];
 }
 
 function networkHealthSummaryTable() {
@@ -6708,12 +7260,26 @@ const children = [
   heading1("Software Lifecycle Summary"),
   sectionTable("Software Lifecycle", D.software_lifecycle.status,
     `• Current AOS Version: ${D.software_lifecycle.aos_version}\n` +
+    (((D.software_lifecycle.aos_lifecycle || {}).legacy_release_type)
+      ? `• Legacy Release Type: ${(D.software_lifecycle.aos_lifecycle || {}).legacy_release_type}\n`
+      : "") +
+    `• Current AHV Version: ${D.software_lifecycle.ahv_version || "N/A"}\n` +
+    `• Current NCC Version: ${D.software_lifecycle.ncc_version || "N/A"}\n` +
     `• AOS Lifecycle Status: ${(D.software_lifecycle.aos_lifecycle || {}).lifecycle_status || "Unknown"}\n` +
-    `• Latest AOS Version: ${(D.software_lifecycle.aos_lifecycle || {}).latest_version || "N/A"}\n` +
-    `• End of Maintenance: ${(D.software_lifecycle.aos_lifecycle || {}).end_of_maintenance || "N/A"}\n` +
-    `• End of Support Life: ${(D.software_lifecycle.aos_lifecycle || {}).end_of_support_life || "N/A"}\n` +
-    `• Upgrade Method: Life Cycle Manager (LCM)`,
+    `• Last Cluster Upgrade: ${D.software_lifecycle.upgrade_status || "N/A"}\n` +
+    (!D.software_lifecycle.ahv_consistent ? `• AHV Version Consistency: Inconsistent / Unknown\n` : "") +
+    `• Firmware Upgrade Recommendations: ${D.software_lifecycle.firmware_recommendations_collected ? (D.software_lifecycle.firmware_updates || []).length : "N/A"}`,
     D.software_lifecycle.recommendations),
+  heading2("Cluster Software Inventory"),
+  softwareInventoryTable(),
+  heading2("AOS Lifecycle Summary"),
+  aosLifecycleSummaryTable(),
+  pageBreak(),
+  ...ahvHostVersionSection(),
+  heading2("Current Firmware Inventory"),
+  firmwareInventoryTable(),
+  heading2("Available Firmware Upgrades"),
+  firmwareUpgradeTable(),
   pageBreak(),
 
   // NCC
