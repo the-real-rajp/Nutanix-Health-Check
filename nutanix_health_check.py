@@ -32,7 +32,6 @@ import sys
 import tempfile
 import time
 import urllib3
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -561,7 +560,6 @@ class ClusterDataCollector:
             ("cvm_virtual_machines", self._cvm_virtual_machines), # optional PE CVM VM details
             ("ahv_version",         self._ahv_version),         # uses VM host UUIDs as fallback
             ("lcm_entities",        self._lcm_entities),        # current software/firmware inventory
-            ("lcm_firmware_recommendations", self._lcm_firmware_recommendations),
             ("alerts",              self._alerts),
             ("protection_policies", self._protection_policies),
             ("recovery_plans",      self._recovery_plans),
@@ -2054,20 +2052,28 @@ class ClusterDataCollector:
         return details
 
     def _licensing(self):
-        # PC-level licensing API paths (try newest first).
-        for path in [
-            "/licensing/v4.0/config/licenses",
-            "/licensing/v4.0/config/license-keys",
-            "/licensing/v4.0/config/clusters",
-            "/licensing/v4.0.b1/config/licenses",
-        ]:
-            try:
-                result = self.client.get(path)
-                if result and result.get("data"):
-                    return result
-            except Exception:
-                continue
-        return None
+        """Collect read-only entitlement, compliance, and violation data."""
+        sources = {}
+        endpoints = {
+            "entitlements": "entitlements",
+            "compliances": "compliances",
+            "violations": "violations",
+        }
+        for ver in ["v4.1", "v4.0"]:
+            for key, resource in endpoints.items():
+                if key in sources:
+                    continue
+                try:
+                    result = self.client.get(
+                        f"/licensing/{ver}/config/{resource}",
+                        params={"$limit": 100},
+                    )
+                    if isinstance(result, dict):
+                        sources[key] = result
+                except Exception:
+                    continue
+
+        return sources or None
 
     def _lcm_entities(self):
         """Collect the current read-only LCM entity inventory for this cluster."""
@@ -2097,150 +2103,6 @@ class ClusterDataCollector:
                 except Exception:
                     continue
         return None
-
-    def _lcm_firmware_recommendations(self):
-        """Calculate and retrieve read-only LCM firmware recommendations.
-
-        This starts only the LCM recommendation calculation. It does not run
-        inventory, prechecks, downloads, staging, or installation.
-        """
-        compute = self.client.post(
-            "/lifecycle/v4.2/operations/$actions/compute-recommendations",
-            body={"recommendationSpec": ["FIRMWARE"]},
-            headers={
-                "NTNX-Request-Id": str(uuid.uuid4()),
-                "X-Cluster-Id": self.cluster_ext_id,
-            },
-        )
-        task_ref = ((compute or {}).get("data") or {}).get("extId")
-        if not task_ref:
-            return {
-                "_collected": False,
-                "_error": "LCM did not return a recommendation task reference.",
-                "_compute": compute,
-            }
-
-        # Prism task references can be either a UUID or a provider-prefixed
-        # value such as "ZXJnb24=:<uuid>". The v3 task API expects the UUID.
-        task_uuid_match = re.search(
-            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-            str(task_ref),
-        )
-        task_uuid = task_uuid_match.group(0) if task_uuid_match else str(task_ref)
-        task = None
-        terminal_status = ""
-        for _ in range(30):
-            task = self.client.get(f"/nutanix/v3/tasks/{task_uuid}")
-            terminal_status = str((task or {}).get("status") or "").upper()
-            if terminal_status in {"SUCCEEDED", "SUCCESS", "COMPLETE", "COMPLETED"}:
-                break
-            if terminal_status in {"FAILED", "FAILURE", "ABORTED", "CANCELLED"}:
-                return {
-                    "_collected": False,
-                    "_error": (task or {}).get("error_detail") or "LCM recommendation calculation failed.",
-                    "_compute": compute,
-                    "_task": task,
-                }
-            time.sleep(1)
-        else:
-            return {
-                "_collected": False,
-                "_error": "Timed out waiting for the LCM recommendation calculation.",
-                "_compute": compute,
-                "_task": task,
-            }
-
-        completion = (
-            (task or {}).get("completion_details")
-            or (task or {}).get("completionDetails")
-            or (task or {}).get("response")
-            or {}
-        )
-
-        recommendation_id = None
-
-        def walk(value, key_hint=""):
-            nonlocal recommendation_id
-            if recommendation_id:
-                return
-            if isinstance(value, dict):
-                label = " ".join(
-                    str(value.get(key) or "")
-                    for key in ("name", "key", "type", "kind", "rel")
-                ).lower()
-                if "recommend" in label or "resource" in label:
-                    uuid_match = re.search(
-                        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                        json.dumps(value, default=str),
-                    )
-                    if uuid_match:
-                        recommendation_id = uuid_match.group(0)
-                        return
-                for key, child in value.items():
-                    walk(child, str(key))
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child, key_hint)
-            elif isinstance(value, str):
-                path_match = re.search(
-                    r"/recommendations/([0-9a-fA-F-]{36})", value
-                )
-                if path_match:
-                    recommendation_id = path_match.group(1)
-                    return
-                if "recommend" in key_hint.lower() or "resource" in key_hint.lower():
-                    uuid_match = re.search(
-                        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                        value,
-                    )
-                    if uuid_match:
-                        recommendation_id = uuid_match.group(0)
-
-        walk(completion)
-        if not recommendation_id:
-            # Completion details belong solely to this recommendation task;
-            # use their first UUID as a compatibility fallback for releases
-            # that return an unlabeled name/value pair.
-            uuid_match = re.search(
-                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                json.dumps(completion, default=str),
-            )
-            if uuid_match:
-                recommendation_id = uuid_match.group(0)
-        if not recommendation_id:
-            # Some releases store the resource reference elsewhere in the
-            # completed task, so perform the same key-aware search once across
-            # the full task response.
-            walk(task or {})
-
-        if not recommendation_id:
-            return {
-                "_collected": False,
-                "_error": "LCM task completed but did not expose a recommendation resource ID.",
-                "_compute": compute,
-                "_task": task,
-            }
-
-        last_error = None
-        for ver in ["v4.2", "v4.1", "v4.0"]:
-            try:
-                result = self.client.get(
-                    f"/lifecycle/{ver}/resources/recommendations/{recommendation_id}"
-                )
-                if isinstance(result, dict):
-                    result["_collected"] = True
-                    result["_recommendation_id"] = recommendation_id
-                    result["_task"] = task
-                    return result
-            except Exception as exc:
-                last_error = exc
-        return {
-            "_collected": False,
-            "_error": f"Unable to retrieve LCM recommendation resource: {last_error}",
-            "_compute": compute,
-            "_task": task,
-            "_recommendation_id": recommendation_id,
-        }
 
     def _ncc_checks(self):
         try:
@@ -4795,37 +4657,198 @@ class HealthAnalyser:
         }
 
     def analyse_licensing(self) -> dict:
-        lic        = self.raw.get("licensing")
-        expiry     = "N/A"
+        lic = self.raw.get("licensing")
+
+        def rows(value):
+            if not isinstance(value, dict):
+                return []
+            data = value.get("data", [])
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+            return [data] if isinstance(data, dict) else []
+
+        # New collection format stores each read-only API response by resource.
+        # Older raw JSON stored the license-list response directly.
+        if isinstance(lic, dict) and any(
+            key in lic for key in ("licenses", "entitlements", "compliances", "violations")
+        ):
+            license_rows = rows(lic.get("licenses"))
+            entitlement_rows = rows(lic.get("entitlements"))
+            compliance_rows = rows(lic.get("compliances"))
+            violation_rows = rows(lic.get("violations"))
+        else:
+            license_rows = rows(lic)
+            entitlement_rows = []
+            compliance_rows = []
+            violation_rows = []
+
+        def text(value, default="N/A"):
+            if value is None or value == "":
+                return default
+            if isinstance(value, dict):
+                return str(value.get("value") or value.get("name") or value.get("type") or default)
+            if str(value).upper() in {"$UNKNOWN", "_UNKNOWN", "UNKNOWN"}:
+                return default
+            words = str(value).replace("_", " ").split()
+            acronyms = {
+                "AHV", "AOS", "NCI", "NCM", "NUS", "NCC", "PC", "PE",
+                "CPU", "KMS", "VM", "VPC",
+            }
+            return " ".join(
+                word.upper() if word.upper() in acronyms else word.title()
+                for word in words
+            )
+
+        cluster_ext_id = str(self._cluster_first().get("extId") or "")
+        cluster_entitlement = None
+        for item in entitlement_rows:
+            cluster_id = str(
+                item.get("clusterExtId")
+                or item.get("cluster_ext_id")
+                or item.get("extId")
+                or ""
+            )
+            if cluster_id and cluster_id != str(self._cluster_first().get("extId") or ""):
+                continue
+            cluster_entitlement = item
+            break
+
+        # The license inventory is Prism Central-wide. For a per-cluster
+        # report, use only the selected cluster's entitlement details.
+        licenses = []
+        if isinstance(cluster_entitlement, dict):
+            details = cluster_entitlement.get("details") or []
+            for item in details if isinstance(details, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                licenses.append({
+                    "name": text(item.get("name")),
+                    "type": text(item.get("type")),
+                    "category": text(item.get("category")),
+                    "meter": text(item.get("meter")),
+                    "quantity": item.get("quantity", "N/A"),
+                    "expiry_date": text(
+                        item.get("earliestExpiryDate")
+                        or item.get("earliest_expiry_date")
+                    ),
+                })
+        elif license_rows:
+            # Compatibility fallback for older raw JSON that contains only a
+            # cluster-scoped license response.
+            for item in license_rows:
+                licenses.append({
+                    "name": text(item.get("name")),
+                    "type": text(item.get("type")),
+                    "category": text(item.get("category")),
+                    "meter": text(item.get("meter")),
+                    "quantity": item.get("quantity", "N/A"),
+                    "expiry_date": text(
+                        item.get("expiryDate")
+                        or item.get("expirationDate")
+                        or item.get("supportExpirationDate")
+                        or item.get("clusterExpiryDate")
+                    ),
+                })
+
+        compliance_services = []
+        for item in compliance_rows:
+            cluster_id = str(
+                item.get("clusterExtId")
+                or item.get("cluster_ext_id")
+                or item.get("extId")
+                or ""
+            )
+            if cluster_id and cluster_id != cluster_ext_id:
+                continue
+            services = item.get("services") or item.get("serviceProjection") or []
+            for service in services if isinstance(services, list) else []:
+                if not isinstance(service, dict):
+                    continue
+                service_violations = service.get("violations") or []
+                compliance_services.append({
+                    "service": text(service.get("name")),
+                    "license_type": text(service.get("licenseType") or service.get("license_type")),
+                    "compliant": (
+                        "Yes" if service.get("isCompliant") is True
+                        else "No" if service.get("isCompliant") is False
+                        else "N/A"
+                    ),
+                    "violation_count": len(service_violations) if isinstance(service_violations, list) else 0,
+                })
+
         violations = []
-        if isinstance(lic, dict):
-            data = lic.get("data", [])
-            if isinstance(data, list) and data:
-                first = data[0]
-            elif isinstance(data, dict):
-                first = data
-            else:
-                first = {}
-            # v4 API expiry field names vary by version
-            expiry = (first.get("expiryDate") or
-                      first.get("expirationDate") or
-                      first.get("supportExpirationDate") or
-                      first.get("clusterExpiryDate") or "N/A")
-            violations  = (first.get("violations") or
-                           first.get("licenseViolations") or [])
-            lic_name    = first.get("name", "N/A")
-            lic_type    = first.get("type", first.get("category", "N/A"))
-        status = self.STATUS_CRITICAL if violations else self.STATUS_HEALTHY
-        recs   = (["License violations detected – contact Nutanix Support immediately."]
-                  if violations else
-                  ["No license violations detected.",
-                   "Plan renewal before expiry date to avoid service disruption."])
+        for item in violation_rows:
+            item_cluster_id = str(
+                item.get("clusterExtId")
+                or item.get("cluster_ext_id")
+                or item.get("extId")
+                or ""
+            )
+            if item_cluster_id and item_cluster_id != cluster_ext_id:
+                continue
+            # The list API returns one Violation container per cluster even
+            # when its violation collections are empty. Count the nested
+            # findings, not the container itself.
+            for key in (
+                "featureViolations", "feature_violations",
+                "capacityViolations", "capacity_violations",
+                "expiredLicenses", "expired_licenses",
+            ):
+                embedded = item.get(key) or []
+                if isinstance(embedded, list):
+                    violations.extend(v for v in embedded if isinstance(v, dict))
+
+        # Some releases embed service violations in the compliance response.
+        for item in compliance_rows:
+            item_cluster_id = str(
+                item.get("clusterExtId")
+                or item.get("cluster_ext_id")
+                or item.get("extId")
+                or ""
+            )
+            if item_cluster_id and item_cluster_id != cluster_ext_id:
+                continue
+            for service in item.get("services") or []:
+                if not isinstance(service, dict):
+                    continue
+                embedded = service.get("violations") or []
+                if isinstance(embedded, list):
+                    violations.extend(v for v in embedded if isinstance(v, dict))
+        for service in compliance_services:
+            if service["compliant"] == "No" and service["violation_count"] == 0:
+                violations.append({"service": service["service"], "type": "Non-compliant"})
+
+        expiry_values = sorted({
+            item["expiry_date"] for item in licenses
+            if item["expiry_date"] not in ("", "N/A")
+        })
+        expiry = ", ".join(expiry_values) if expiry_values else "N/A"
+        lic_name = ", ".join(dict.fromkeys(
+            [item["name"] for item in licenses if item["name"] != "N/A"]
+        )) or "N/A"
+        lic_type = ", ".join(dict.fromkeys(
+            [item["type"] for item in licenses if item["type"] != "N/A"]
+        )) or "N/A"
+
+        non_compliant = [item for item in compliance_services if item["compliant"] == "No"]
+        status = self.STATUS_CRITICAL if violations or non_compliant else self.STATUS_HEALTHY
+        recs = (
+            ["Review license compliance violations and remediate them with Nutanix Support or your licensing administrator."]
+            if status == self.STATUS_CRITICAL
+            else [
+                "No license compliance violations detected.",
+                "Plan renewal before the applicable expiry date to avoid service disruption.",
+            ]
+        )
         return {
             "status":          status,
             "expiry_date":     expiry,
-            "license_name":    lic_name if lic else "N/A",
-            "license_type":    lic_type if lic else "N/A",
+            "license_name":    lic_name,
+            "license_type":    lic_type,
             "violations":      violations,
+            "licenses":        licenses,
+            "compliance_services": compliance_services,
+            "violation_count": len(violations),
             "recommendations": recs,
         }
 
@@ -5124,8 +5147,12 @@ class HealthAnalyser:
         # Cluster Management and host responses.  Keep lifecycle evaluation
         # limited to AOS until an authoritative matrix/API is collected for
         # AHV and NCC.
+        cluster_software_map = [
+            entry for entry in (cfg.get("clusterSoftwareMap", []) or [])
+            if isinstance(entry, dict)
+        ]
         ncc_version = "N/A"
-        for entry in cfg.get("clusterSoftwareMap", []) or []:
+        for entry in cluster_software_map:
             if str(entry.get("softwareType", "")).upper() == "NCC":
                 ncc_version = str(entry.get("version") or "N/A").replace("ncc-", "")
                 break
@@ -5187,119 +5214,102 @@ class HealthAnalyser:
             for key, count in sorted(firmware_groups.items(), key=lambda item: (item[0][0].lower(), item[0][2].lower(), item[0][1]))
         ]
 
-        firmware_by_id = {
-            str(entity.get("extId")): entity
-            for entity in lcm_entities
-            if entity.get("extId")
-            and str(entity.get("entityType") or "").upper() == "FIRMWARE"
-        }
-        raw_firmware_recommendations = self.raw.get("lcm_firmware_recommendations")
-        firmware_recommendations_collected = (
-            isinstance(raw_firmware_recommendations, dict)
-            and raw_firmware_recommendations.get("_collected") is True
-        )
-        firmware_recommendation_error = (
-            raw_firmware_recommendations.get("_error", "")
-            if isinstance(raw_firmware_recommendations, dict)
-            else ""
-        )
+        def normalise_component(value):
+            return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
 
-        recommendation_specs = []
+        requested_components = [
+            ("AHV hypervisor", {"AHV", "AHV HYPERVISOR", "HYPERVISOR"}),
+            ("AOS", {"AOS", "NOS"}),
+            ("FSM", {"FSM", "FOUNDATION SERVICE MANAGER"}),
+            ("Foundation", {"FOUNDATION"}),
+            ("Foundation Platforms", {"FOUNDATION PLATFORMS", "FOUNDATION PLATFORM"}),
+            ("Licensing", {"LICENSING", "LICENSE"}),
+            ("NCC", {"NCC"}),
+            ("Security AOS", {"SECURITY AOS", "SECURITY AOS SERVICE"}),
+        ]
+        versions_by_component = {name: set() for name, _ in requested_components}
 
-        def collect_update_specs(value):
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    if key in {"entityUpdateSpecs", "entity_update_specs"} and isinstance(child, list):
-                        recommendation_specs.extend(item for item in child if isinstance(item, dict))
-                    else:
-                        collect_update_specs(child)
-            elif isinstance(value, list):
-                for child in value:
-                    collect_update_specs(child)
+        def assign_version(label, version):
+            normalised = normalise_component(label)
+            version_text = str(version or "").strip()
+            if not normalised or not version_text:
+                return
+            # Match the most specific aliases first so Foundation Platforms is
+            # not incorrectly assigned to the Foundation row.
+            for display_name, aliases in sorted(
+                requested_components,
+                key=lambda item: max(len(alias) for alias in item[1]),
+                reverse=True,
+            ):
+                if normalised in aliases:
+                    if display_name == "NCC":
+                        version_text = re.sub(r"^ncc-", "", version_text, flags=re.IGNORECASE)
+                    versions_by_component[display_name].add(version_text)
+                    return
+            for display_name, aliases in sorted(
+                requested_components,
+                key=lambda item: max(len(alias) for alias in item[1]),
+                reverse=True,
+            ):
+                if any(alias in normalised for alias in aliases):
+                    if display_name == "NCC":
+                        version_text = re.sub(r"^ncc-", "", version_text, flags=re.IGNORECASE)
+                    versions_by_component[display_name].add(version_text)
+                    return
 
-        if isinstance(raw_firmware_recommendations, dict):
-            collect_update_specs(raw_firmware_recommendations.get("data", raw_firmware_recommendations))
-
-        firmware_update_groups = {}
-        for spec in recommendation_specs:
-            entity_id = str(
-                spec.get("entityUuid")
-                or spec.get("entityExtId")
-                or spec.get("entityId")
-                or spec.get("extId")
-                or ""
-            )
-            entity = firmware_by_id.get(entity_id, {})
-            target_version = (
-                spec.get("toVersion")
-                or spec.get("targetVersion")
-                or spec.get("version")
-                or spec.get("entityVersion")
-                or "N/A"
-            )
-            component = (
+        for entry in cluster_software_map:
+            assign_version(entry.get("softwareType"), entry.get("version"))
+        for entity in lcm_entities:
+            if str(entity.get("entityType") or "").upper() == "FIRMWARE":
+                continue
+            label = (
                 entity.get("entityModel")
-                or spec.get("entityModel")
-                or spec.get("entityClass")
-                or spec.get("entityType")
-                or "Firmware Component"
+                or entity.get("entityClass")
+                or entity.get("entityDescription")
+                or entity.get("entityType")
             )
-            current_version = (
-                entity.get("entityVersion")
-                or spec.get("fromVersion")
-                or spec.get("currentVersion")
-                or "N/A"
-            )
-            vendor = entity.get("hardwareVendor") or spec.get("hardwareVendor") or "N/A"
-            key = (str(component), str(current_version), str(target_version), str(vendor))
-            firmware_update_groups[key] = firmware_update_groups.get(key, 0) + 1
+            assign_version(label, entity.get("entityVersion"))
 
-        firmware_updates = [
-            {
-                "component": key[0],
-                "current_version": key[1],
-                "available_version": key[2],
-                "vendor": key[3],
-                "instances": count,
-                "status": self.STATUS_RECOMMENDED,
-            }
-            for key, count in sorted(
-                firmware_update_groups.items(),
-                key=lambda item: (item[0][0].lower(), item[0][1], item[0][2]),
-            )
-        ]
+        versions_by_component["AHV hypervisor"] = (
+            set(observed_ahv_versions)
+            if observed_ahv_versions
+            else ({str(cluster_ahv)} if cluster_ahv not in ("", "N/A", None) else set())
+        )
+        versions_by_component["AOS"] = {str(aos)} if aos not in ("", "N/A", None) else set()
+        if ncc_version not in ("", "N/A", None):
+            versions_by_component["NCC"].add(str(ncc_version))
 
-        software_inventory = [
-            {
-                "component": "AOS",
-                "installed_version": aos,
-                "consistency": "Consistent" if aos != "N/A" else "Unknown",
-                "lifecycle_status": aos_lifecycle.get("lifecycle_status", "Unknown"),
-                "status": aos_lifecycle.get("report_status", self.STATUS_RECOMMENDED),
-            },
-            {
-                "component": "AHV",
-                "installed_version": cluster_ahv,
-                "consistency": "Consistent" if ahv_consistent else "Inconsistent / Unknown",
-                "lifecycle_status": "Not evaluated",
-                "status": self.STATUS_HEALTHY if ahv_consistent else self.STATUS_CRITICAL,
-            },
-            {
-                "component": "NCC",
-                "installed_version": ncc_version,
-                "consistency": "Consistent" if ncc_version != "N/A" else "Unknown",
-                "lifecycle_status": "Not evaluated",
-                "status": self.STATUS_HEALTHY if ncc_version != "N/A" else self.STATUS_RECOMMENDED,
-            },
-        ]
+        software_inventory = []
+        for component, _ in requested_components:
+            versions = sorted(versions_by_component[component], key=_version_tuple)
+            if not versions:
+                installed_version = "N/A"
+                consistency = "N/A"
+                component_status = self.STATUS_HEALTHY
+            elif len(versions) == 1:
+                installed_version = versions[0].replace("ncc-", "")
+                consistency = "Consistent"
+                component_status = (
+                    aos_lifecycle.get("report_status", self.STATUS_RECOMMENDED)
+                    if component == "AOS"
+                    else self.STATUS_HEALTHY
+                )
+            else:
+                installed_version = ", ".join(versions)
+                consistency = "Inconsistent"
+                component_status = self.STATUS_CRITICAL
+            software_inventory.append({
+                "component": component,
+                "installed_version": installed_version,
+                "consistency": consistency,
+                "status": component_status,
+            })
 
         if any(item["status"] == self.STATUS_CRITICAL for item in software_inventory):
             status = self.STATUS_CRITICAL
         elif status != self.STATUS_CRITICAL and (
             any(item["status"] == self.STATUS_RECOMMENDED for item in software_inventory)
             or not lcm_inventory_collected
-            or bool(firmware_updates)
-            or not firmware_recommendations_collected
         ):
             status = self.STATUS_RECOMMENDED
 
@@ -5320,13 +5330,9 @@ class HealthAnalyser:
             "Maintain NCC on a version supported by LCM.",
         ]
         if not lcm_inventory_collected:
-            recs.append("Run an LCM inventory to refresh the current firmware inventory.")
-        if firmware_updates:
             recs.append(
-                f"Review and schedule {len(firmware_updates)} firmware upgrade recommendation group(s) through LCM."
+                "Review the LCM inventory status in Prism Central; this health check does not trigger inventory operations."
             )
-        elif not firmware_recommendations_collected:
-            recs.append("Calculate LCM firmware recommendations and review supported firmware updates.")
         return {
             "status": status,
             "aos_version": aos,
@@ -5339,9 +5345,6 @@ class HealthAnalyser:
             "ahv_consistent": ahv_consistent,
             "lcm_inventory_collected": lcm_inventory_collected,
             "firmware_inventory": firmware_inventory,
-            "firmware_recommendations_collected": firmware_recommendations_collected,
-            "firmware_recommendation_error": firmware_recommendation_error,
-            "firmware_updates": firmware_updates,
             "recommendations": recs,
         }
 
@@ -5585,7 +5588,7 @@ function sectionRecommendedActions(recommendations, status) {
 
   // A generic no-action placeholder is appropriate only for a Healthy section.
   // If the section has findings, replace it with an actionable fallback so the
-  // priority and recommendation do not contradict each other.
+  // severity and recommendation do not contradict each other.
   if (status !== "Healthy") {
     items = items.filter(item => !/^no immediate action required\.?$/i.test(item));
   }
@@ -5596,8 +5599,7 @@ function sectionRecommendedActions(recommendations, status) {
       ? "Review the findings identified in this section during the next maintenance window."
       : "No immediate action required. Continue routine monitoring.",
   ];
-  const priority = status === "Critical" ? "High" : status === "Recommended" ? "Medium" : "Low";
-  const priorityFill = priority === "High" ? "FCE8E6" : priority === "Medium" ? "FFF4CC" : "E6F4EA";
+  const severity = status === "Critical" ? "Critical" : status === "Recommended" ? "Warning" : "Info";
   const CW = [1800, 9000];
   return [
     heading2("Recommended Actions"),
@@ -5607,10 +5609,10 @@ function sectionRecommendedActions(recommendations, status) {
       columnWidths: CW,
       rows: [
         new TableRow({ tableHeader: true, cantSplit: true, children: [
-          hdrCell("Priority", CW[0]), hdrCell("Recommended Action", CW[1]),
+          hdrCell("Severity", CW[0]), hdrCell("Recommended Action", CW[1]),
         ]}),
         ...actions.map((action, i) => new TableRow({ cantSplit: true, children: [
-          cell(priority, { width: CW[0], shading: priorityFill, bold: true }),
+          severityTextCell(severity, CW[0], i % 2 === 0 ? "FFFFFF" : ROW_ALT),
           cell(action, { width: CW[1], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
         ]})),
       ],
@@ -5855,6 +5857,35 @@ function correlatedAlertTable(alerts) {
   });
 }
 
+function severityTextCell(severity, width, shading) {
+  const value = String(severity || "Info").toUpperCase();
+  const upper = value;
+  const color = upper.includes("CRITICAL")
+    ? "CC0000"
+    : upper.includes("WARNING")
+    ? "E5A000"
+    : upper.includes("INFO")
+    ? "4F81BD"
+    : "666666";
+  return new TableCell({
+    borders: BORDERS,
+    shading: { fill: shading || "FFFFFF", type: ShadingType.CLEAR },
+    margins: { top: 60, bottom: 60, left: 120, right: 120 },
+    width: { size: width, type: WidthType.DXA },
+    verticalAlign: VerticalAlign.CENTER,
+    children: [new Paragraph({
+      children: [new TextRun({
+        text: value,
+        font: REPORT_FONT,
+        size: TABLE_FONT_SIZE,
+        bold: true,
+        color,
+      })],
+      spacing: { before: 0, after: 0 },
+    })],
+  });
+}
+
 function securityStatusCell(status, width, shading) {
   const value = String(status || "N/A");
   const runs = STATUS_COLORS[value]
@@ -5964,6 +5995,62 @@ function encryptionSecuritySummaryTable() {
   });
 }
 
+function licenseDetailsTable() {
+  const items = Array.isArray(D.licensing.licenses) ? D.licensing.licenses : [];
+  if (!items.length) return body("Applied license details were not available from the collected licensing APIs.", { italic: true });
+  const CW = [2800, 1500, 1700, 1500, 1400, 1900];
+  return new Table({
+    layout: TableLayoutType.AUTOFIT,
+    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+    columnWidths: CW,
+    rows: [
+      new TableRow({ tableHeader: true, cantSplit: true, children: [
+        hdrCell("License", CW[0]), hdrCell("Type", CW[1]), hdrCell("Category", CW[2]),
+        hdrCell("Meter", CW[3]), hdrCell("Quantity", CW[4]), hdrCell("Expiry Date", CW[5]),
+      ]}),
+      ...items.map((item, i) => {
+        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+        return new TableRow({ cantSplit: true, children: [
+          cell(item.name || "N/A", { width: CW[0], shading: bg, bold: true }),
+          cell(item.type || "N/A", { width: CW[1], shading: bg }),
+          cell(item.category || "N/A", { width: CW[2], shading: bg }),
+          cell(item.meter || "N/A", { width: CW[3], shading: bg }),
+          cell(item.quantity ?? "N/A", { width: CW[4], shading: bg }),
+          cell(item.expiry_date || "N/A", { width: CW[5], shading: bg }),
+        ]});
+      }),
+    ],
+  });
+}
+
+function licenseComplianceTable() {
+  const items = Array.isArray(D.licensing.compliance_services) ? D.licensing.compliance_services : [];
+  if (!items.length) return [];
+  const CW = [5000, 3800, 2000];
+  return [
+    heading2("License Compliance Summary"),
+    new Table({
+      layout: TableLayoutType.AUTOFIT,
+      width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+      columnWidths: CW,
+      rows: [
+        new TableRow({ tableHeader: true, cantSplit: true, children: [
+          hdrCell("Service", CW[0]), hdrCell("License Type", CW[1]),
+          hdrCell("Violations", CW[2]),
+        ]}),
+        ...items.map((item, i) => {
+          const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
+          return new TableRow({ cantSplit: true, children: [
+            cell(item.service || "N/A", { width: CW[0], shading: bg, bold: true }),
+            cell(item.license_type || "N/A", { width: CW[1], shading: bg }),
+            cell(item.violation_count ?? 0, { width: CW[2], shading: bg }),
+          ]});
+        }),
+      ],
+    }),
+  ];
+}
+
 function softwareInventoryTable() {
   const items = Array.isArray(D.software_lifecycle.software_inventory) ? D.software_lifecycle.software_inventory : [];
   const CW = [3000, 3900, 3900];
@@ -5982,37 +6069,6 @@ function softwareInventoryTable() {
           cell(item.component || "N/A", { width: CW[0], shading: bg, bold: true }),
           cell(item.installed_version || "N/A", { width: CW[1], shading: bg }),
           cell(item.consistency || "N/A", { width: CW[2], shading: bg }),
-        ]});
-      }),
-    ],
-  });
-}
-
-function aosLifecycleSummaryTable() {
-  const lifecycle = D.software_lifecycle.aos_lifecycle || {};
-  const current = D.software_lifecycle.aos_version || "N/A";
-  const latest = lifecycle.latest_version || "N/A";
-  const upgradeStatus = D.software_lifecycle.upgrade_status || "N/A";
-  const rows = [
-    ["Current AOS Version", current],
-    ...(lifecycle.legacy_release_type ? [["Legacy Release Type", lifecycle.legacy_release_type]] : []),
-    ["Latest Version in Lifecycle Data", latest],
-    ["End of Maintenance", lifecycle.end_of_maintenance || "N/A"],
-    ["End of Support Life", lifecycle.end_of_support_life || "N/A"],
-    ["Last Cluster Upgrade", upgradeStatus],
-  ];
-  const CW = [4300, 6500];
-  return new Table({
-    layout: TableLayoutType.AUTOFIT,
-    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
-    columnWidths: CW,
-    rows: [
-      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Item", CW[0]), hdrCell("Value", CW[1])] }),
-      ...rows.map((row, i) => {
-        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
-        return new TableRow({ cantSplit: true, children: [
-          cell(row[0], { width: CW[0], shading: bg, bold: true }),
-          cell(row[1], { width: CW[1], shading: bg }),
         ]});
       }),
     ],
@@ -6046,42 +6102,6 @@ function firmwareInventoryTable() {
           cell(item.current_version || "N/A", { width: CW[1], shading: bg }),
           cell(item.vendor || "N/A", { width: CW[2], shading: bg }),
           cell(item.instances ?? 0, { width: CW[3], shading: bg }),
-        ]});
-      }),
-    ],
-  });
-}
-
-function firmwareUpgradeTable() {
-  const items = Array.isArray(D.software_lifecycle.firmware_updates) ? D.software_lifecycle.firmware_updates : [];
-  if (items.length === 0) {
-    return body(
-      D.software_lifecycle.firmware_recommendations_collected
-        ? "No firmware upgrades were recommended by LCM."
-        : "Firmware upgrade recommendations were not available from LCM for this report.",
-      { italic: true }
-    );
-  }
-  const CW = [2800, 1600, 1700, 1400, 1400, 1900];
-  return new Table({
-    layout: TableLayoutType.AUTOFIT,
-    width: { size: CONTENT_WIDTH, type: WidthType.DXA },
-    columnWidths: CW,
-    rows: [
-      new TableRow({ tableHeader: true, cantSplit: true, children: [
-        hdrCell("Component", CW[0]), hdrCell("Current Version", CW[1]),
-        hdrCell("Available Version", CW[2]), hdrCell("Vendor", CW[3]),
-        hdrCell("Instances", CW[4]), hdrCell("Status", CW[5]),
-      ]}),
-      ...items.map((item, i) => {
-        const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
-        return new TableRow({ cantSplit: true, children: [
-          cell(item.component || "N/A", { width: CW[0], shading: bg, bold: true }),
-          cell(item.current_version || "N/A", { width: CW[1], shading: bg }),
-          cell(item.available_version || "N/A", { width: CW[2], shading: bg }),
-          cell(item.vendor || "N/A", { width: CW[3], shading: bg }),
-          cell(item.instances ?? 0, { width: CW[4], shading: bg, center: true }),
-          securityStatusCell(item.status || "Recommended", CW[5], bg),
         ]});
       }),
     ],
@@ -6405,13 +6425,6 @@ function severityColor(sev) {
   return "FFFFFF";
 }
 
-function priorityColor(priority) {
-  if (priority === "High") return "F8D7DA";
-  if (priority === "Medium") return "FFF3CD";
-  if (priority === "Low") return "D6E8F7";
-  return "FFFFFF";
-}
-
 function executiveHealthScoreTable() {
   const score = executiveHealthScore();
   const label = scoreLabel(score);
@@ -6649,7 +6662,7 @@ function clusterConfigSummaryTable() {
 function recommendationFromAlert(a) {
   const title = String(a.title || "Alert");
   const sev = String(a.severity || "INFO").toUpperCase();
-  let priority = sev.includes("CRITICAL") ? "High" : sev.includes("WARNING") ? "Medium" : "Low";
+  let severity = sev.includes("CRITICAL") ? "Critical" : sev.includes("WARNING") ? "Warning" : "Info";
   let recommendation = "Review and remediate the active alert in Prism Central.";
   if (/default password/i.test(title)) recommendation = "Change default credentials immediately.";
   else if (/password.*ssh|ssh.*password/i.test(title)) recommendation = "Disable password-based SSH where appropriate and use key-based access.";
@@ -6657,19 +6670,19 @@ function recommendationFromAlert(a) {
   else if (/disk|unqualified|mounted/i.test(title)) recommendation = "Investigate disk qualification, mount state, and hardware health before adding workload.";
   else if (/snapshot/i.test(title)) recommendation = "Review snapshot and protection policy configuration for the affected entity.";
   else if (/latency/i.test(title)) recommendation = "Review network path and remote availability zone latency with Nutanix Support if persistent.";
-  return { priority, recommendation, reason: title };
+  return { severity, recommendation, reason: title };
 }
 
 function recommendedActions() {
   const out = [];
   const seen = new Set();
-  const priorityOrder = { High: 0, Medium: 1, Low: 2 };
+  const severityOrder = { Critical: 0, Warning: 1, Info: 2 };
 
   for (const a of (D.health.alert_details || []).sort((a,b) => severityRank(b.severity) - severityRank(a.severity))) {
     const item = recommendationFromAlert(a);
     // Deduplicate by action so repeated alerts, such as multiple hosts using
     // default credentials, produce one clean remediation item.
-    const key = item.priority + "|" + item.recommendation;
+    const key = item.severity + "|" + item.recommendation;
     if (!seen.has(key)) {
       out.push(item);
       seen.add(key);
@@ -6677,17 +6690,17 @@ function recommendedActions() {
   }
 
   if (out.length === 0) {
-    out.push({ priority: "Low", recommendation: "No immediate alert remediation required. Continue routine monitoring and scheduled health reviews.", reason: "No active alert findings were detected." });
+    out.push({ severity: "Info", recommendation: "No immediate alert remediation required. Continue routine monitoring and scheduled health reviews.", reason: "No active alert findings were detected." });
   }
 
   return out
-    .sort((a, b) => (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99) || String(a.recommendation).localeCompare(String(b.recommendation)))
+    .sort((a, b) => (severityOrder[a.severity] ?? 99) - (severityOrder[b.severity] ?? 99) || String(a.recommendation).localeCompare(String(b.recommendation)))
     .slice(0, 15);
 }
 
 function recommendedActionsTable() {
   const actions = recommendedActions();
-  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [1600, 5200, 4000], rows: [new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Priority", 1600), hdrCell("Recommendation", 5200), hdrCell("Reason", 4000)] }), ...actions.map((a, i) => new TableRow({ cantSplit: true, children: [cell(a.priority, { width: 1600, shading: priorityColor(a.priority), bold: true }), cell(a.recommendation, { width: 5200, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }), cell(a.reason, { width: 4000, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT })] }))] });
+  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [1600, 5200, 4000], rows: [new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Severity", 1600), hdrCell("Recommendation", 5200), hdrCell("Reason", 4000)] }), ...actions.map((a, i) => { const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT; return new TableRow({ cantSplit: true, children: [severityTextCell(a.severity, 1600, bg), cell(a.recommendation, { width: 5200, shading: bg }), cell(a.reason, { width: 4000, shading: bg })] }); })] });
 }
 
 function protectionPolicySummaryTable() {
@@ -7236,9 +7249,16 @@ const children = [
   // LICENSING
   heading1("Licensing Summary"),
   sectionTable("Licensing", D.licensing.status,
-    `• License: ${D.licensing.license_name} (${D.licensing.license_type})\n• Support/License Expiry: ${D.licensing.expiry_date}\n• Violations: ${D.licensing.violations.length === 0 ? "None" : D.licensing.violations.join(", ")}`,
+    `• License: ${D.licensing.license_name} (${D.licensing.license_type})\n` +
+    `• Support/License Expiry: ${D.licensing.expiry_date}\n` +
+    `• Applied License Records: ${(D.licensing.licenses || []).length}\n` +
+    `• Compliance Services: ${(D.licensing.compliance_services || []).length}\n` +
+    `• Violations: ${D.licensing.violation_count || 0}`,
     D.licensing.recommendations),
   ...sectionRecommendedActions(D.licensing.recommendations, D.licensing.status),
+  heading2("Applied License Details"),
+  licenseDetailsTable(),
+  ...licenseComplianceTable(),
   pageBreak(),
 
   // SECURITY
@@ -7278,20 +7298,15 @@ const children = [
     `• Current NCC Version: ${D.software_lifecycle.ncc_version || "N/A"}\n` +
     `• AOS Lifecycle Status: ${(D.software_lifecycle.aos_lifecycle || {}).lifecycle_status || "Unknown"}\n` +
     `• Last Cluster Upgrade: ${D.software_lifecycle.upgrade_status || "N/A"}\n` +
-    (!D.software_lifecycle.ahv_consistent ? `• AHV Version Consistency: Inconsistent / Unknown\n` : "") +
-    `• Firmware Upgrade Recommendations: ${D.software_lifecycle.firmware_recommendations_collected ? (D.software_lifecycle.firmware_updates || []).length : "N/A"}`,
+    (!D.software_lifecycle.ahv_consistent ? `• AHV Version Consistency: Inconsistent / Unknown` : ""),
     D.software_lifecycle.recommendations),
   ...sectionRecommendedActions(D.software_lifecycle.recommendations, D.software_lifecycle.status),
   heading2("Cluster Software Inventory"),
   softwareInventoryTable(),
-  heading2("AOS Lifecycle Summary"),
-  aosLifecycleSummaryTable(),
-  pageBreak(),
   ...ahvHostVersionSection(),
   heading2("Current Firmware Inventory"),
+  body("Read-only reporting: this health check reads existing LCM entity data and does not run LCM inventory, compute recommendations, or apply updates.", { italic: true }),
   firmwareInventoryTable(),
-  heading2("Available Firmware Upgrades"),
-  firmwareUpgradeTable(),
   pageBreak(),
 ];
 
