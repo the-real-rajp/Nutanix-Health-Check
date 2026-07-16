@@ -5425,7 +5425,7 @@ const NUTANIX_BLUE   = "005F9E";
 const NUTANIX_LIGHT  = "D6E8F7";
 const HEADER_GREY    = "404040";
 const ROW_ALT        = "F2F7FB";
-const STATUS_COLORS  = { "Healthy": "00843D", "Recommended": "E5A000", "Critical": "CC0000" };
+const STATUS_COLORS  = { "Healthy": "00843D", "Recommended": "E5A000", "Critical": "CC0000", "Active": "00843D" };
 const LINK_BLUE = "0563C1";
 const SECTION_BOOKMARKS = {
   "Virtual Machines Summary": "sec_virtual_machines",
@@ -5441,7 +5441,15 @@ const SECTION_BOOKMARKS = {
 };
 
 function statusRun(status) {
-  return new TextRun({ text: `● ${status}`, bold: true, color: STATUS_COLORS[status] || "000000", size: REPORT_FONT_SIZE, font: REPORT_FONT });
+  const raw = String(status || "N/A");
+  const key = Object.keys(STATUS_COLORS).find(k => k.toLowerCase() === raw.toLowerCase());
+  return new TextRun({
+    text: raw.toUpperCase(),
+    bold: true,
+    color: key ? STATUS_COLORS[key] : "000000",
+    size: REPORT_FONT_SIZE,
+    font: REPORT_FONT,
+  });
 }
 
 function heading1(text) {
@@ -5733,7 +5741,7 @@ function vmDetailTable() {
     return new TableRow({ cantSplit: true, children: [
       mkCell(vm.name,        CW[0], { fill: bg, bold: true }),
       new TableCell({ borders: { top: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" }, bottom: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" }, left: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" }, right: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" } }, shading: { fill: bg, type: ShadingType.CLEAR }, margins: { top: 60, bottom: 60, left: 80, right: 80 }, width: { size: CW[1], type: WidthType.DXA },
-        children: [new Paragraph({ children: [new TextRun({ text: vm.power === "ON" ? "On" : "Off", font: REPORT_FONT, size: TABLE_FONT_SIZE, bold: true, color: vm.power === "ON" ? "00843D" : "CC0000" })] })],
+        children: [new Paragraph({ children: [new TextRun({ text: vm.power === "ON" ? "ON" : "OFF", font: REPORT_FONT, size: TABLE_FONT_SIZE, bold: true, color: vm.power === "ON" ? "00843D" : "CC0000" })] })],
       }),
       mkCell(vm.ip,          CW[2], { fill: bg, size: 18 }),
       mkCell(vm.os,          CW[3], { fill: bg, size: 18 }),
@@ -5795,8 +5803,8 @@ function cvmTable() {
   const hdrRow = new TableRow({ tableHeader: true, cantSplit: true, children: hdrs.map((h, i) => mkHdr(h, CW[i])) });
   const dataRows = cvms.map((cvm, i) => {
     const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
-    const powerText  = String(cvm.cvm_power || "N/A").toUpperCase() === "ON" ? "On" : "Off";
-    const powerColor = powerText === "On" ? "00843D" : "CC0000";
+    const powerText  = String(cvm.cvm_power || "N/A").toUpperCase() === "ON" ? "ON" : "OFF";
+    const powerColor = powerText === "ON" ? "00843D" : "CC0000";
     return new TableRow({ cantSplit: true, children: [
       mkCell(cvm.cvm_name || "N/A", CW[0], { fill: bg, bold: true }),
       mkCell(cvm.host_name || "N/A", CW[1], { fill: bg, bold: true }),
@@ -5888,9 +5896,10 @@ function severityTextCell(severity, width, shading) {
 
 function securityStatusCell(status, width, shading) {
   const value = String(status || "N/A");
-  const runs = STATUS_COLORS[value]
+  const statusKey = Object.keys(STATUS_COLORS).find(k => k.toLowerCase() === value.toLowerCase());
+  const runs = statusKey
     ? [statusRun(value)]
-    : [new TextRun({ text: value, font: REPORT_FONT, size: TABLE_FONT_SIZE, color: "666666" })];
+    : [new TextRun({ text: value.toUpperCase(), font: REPORT_FONT, size: TABLE_FONT_SIZE, color: "666666" })];
   return new TableCell({
     borders: BORDERS,
     shading: shading ? { fill: shading, type: ShadingType.CLEAR } : undefined,
@@ -5998,25 +6007,23 @@ function encryptionSecuritySummaryTable() {
 function licenseDetailsTable() {
   const items = Array.isArray(D.licensing.licenses) ? D.licensing.licenses : [];
   if (!items.length) return body("Applied license details were not available from the collected licensing APIs.", { italic: true });
-  const CW = [2800, 1500, 1700, 1500, 1400, 1900];
+  const CW = [3600, 2200, 2200, 2800];
   return new Table({
     layout: TableLayoutType.AUTOFIT,
     width: { size: CONTENT_WIDTH, type: WidthType.DXA },
     columnWidths: CW,
     rows: [
       new TableRow({ tableHeader: true, cantSplit: true, children: [
-        hdrCell("License", CW[0]), hdrCell("Type", CW[1]), hdrCell("Category", CW[2]),
-        hdrCell("Meter", CW[3]), hdrCell("Quantity", CW[4]), hdrCell("Expiry Date", CW[5]),
+        hdrCell("License", CW[0]), hdrCell("Type", CW[1]),
+        hdrCell("Quantity", CW[2]), hdrCell("Expiry Date", CW[3]),
       ]}),
       ...items.map((item, i) => {
         const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
         return new TableRow({ cantSplit: true, children: [
           cell(item.name || "N/A", { width: CW[0], shading: bg, bold: true }),
           cell(item.type || "N/A", { width: CW[1], shading: bg }),
-          cell(item.category || "N/A", { width: CW[2], shading: bg }),
-          cell(item.meter || "N/A", { width: CW[3], shading: bg }),
-          cell(item.quantity ?? "N/A", { width: CW[4], shading: bg }),
-          cell(item.expiry_date || "N/A", { width: CW[5], shading: bg }),
+          cell(item.quantity ?? "N/A", { width: CW[2], shading: bg }),
+          cell(item.expiry_date || "N/A", { width: CW[3], shading: bg }),
         ]});
       }),
     ],
@@ -6164,7 +6171,7 @@ function networkHealthSummaryTable() {
 
 function networkStatusRun(value) {
   const text = String(value || "").toLowerCase();
-  if (["ignore", "ignored"].some(x => text === x)) return new TextRun({ text: "Ignored", font: REPORT_FONT, size: TABLE_FONT_SIZE, bold: true, color: "666666" });
+  if (["ignore", "ignored"].some(x => text === x)) return new TextRun({ text: "IGNORED", font: REPORT_FONT, size: TABLE_FONT_SIZE, bold: true, color: "666666" });
   if (["normal", "healthy", "up", "active", "connected"].some(x => text.includes(x))) return statusRun("Healthy");
   if (["warning", "degraded", "unknown", "inactive"].some(x => text.includes(x))) return statusRun("Recommended");
   if (["critical", "down", "failed", "error", "disconnected"].some(x => text.includes(x))) return statusRun("Critical");
@@ -6174,15 +6181,14 @@ function networkStatusRun(value) {
 function hostNetworkSummaryTable() {
   const list = D.network.host_ip_summary || [];
   if (!list.length) return body("No host network summary data available.");
-  const CW = [2600, 2100, 2100, 2100, 1900];
+  const CW = [3000, 2600, 2600, 2600];
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
-    new TableRow({ tableHeader: true, cantSplit: true, children: ["Host", "AHV IP", "CVM IP", "IPMI IP", "Status"].map((h, i) => hdrCell(h, CW[i])) }),
+    new TableRow({ tableHeader: true, cantSplit: true, children: ["Host", "AHV IP", "CVM IP", "IPMI IP"].map((h, i) => hdrCell(h, CW[i])) }),
     ...list.map((n, i) => new TableRow({ cantSplit: true, children: [
       cell(n.host || "N/A", { width: CW[0], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT, bold: true }),
       cell(n.ahv_ip || "N/A", { width: CW[1], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
       cell(n.cvm_ip || "N/A", { width: CW[2], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
       cell(n.ipmi_ip || "N/A", { width: CW[3], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
-      new TableCell({ borders: BORDERS, margins: { top: 60, bottom: 60, left: 100, right: 100 }, width: { size: CW[4], type: WidthType.DXA }, shading: { fill: i % 2 === 0 ? "FFFFFF" : ROW_ALT, type: ShadingType.CLEAR }, children: [new Paragraph({ children: [networkStatusRun(n.status)], spacing: { before: 0, after: 0 } })] }),
     ]})),
   ]});
 }
@@ -6209,14 +6215,13 @@ function vlanSummaryTable() {
 function bridgeSummaryTable() {
   const list = D.network.bridge_summary || [];
   if (!list.length) return body("No OVS bridge data available from the collected APIs.", { italic: true });
-  const CW = [2500, 3300, 3800, 1200];
+  const CW = [2800, 3500, 4500];
   return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: CW, rows: [
-    new TableRow({ tableHeader: true, cantSplit: true, children: ["Bridge", "VLANs", "Virtual Switch", "Status"].map((h, i) => hdrCell(h, CW[i])) }),
+    new TableRow({ tableHeader: true, cantSplit: true, children: ["Bridge", "VLANs", "Virtual Switch"].map((h, i) => hdrCell(h, CW[i])) }),
     ...list.map((b, i) => new TableRow({ cantSplit: true, children: [
       cell(b.bridge || "N/A", { width: CW[0], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT, bold: true }),
       cell(b.vlans || "N/A", { width: CW[1], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
       cell(b.virtual_switch || "N/A", { width: CW[2], shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
-      new TableCell({ borders: BORDERS, margins: { top: 60, bottom: 60, left: 100, right: 100 }, width: { size: CW[3], type: WidthType.DXA }, shading: { fill: i % 2 === 0 ? "FFFFFF" : ROW_ALT, type: ShadingType.CLEAR }, children: [new Paragraph({ children: [networkStatusRun(b.status)], spacing: { before: 0, after: 0 } })] }),
     ]})),
   ]});
 }
@@ -6459,7 +6464,7 @@ function alertSeveritySummaryTable() {
   const info = Math.max(0, (D.health.total_alerts || 0) - critical - warning);
   const max = Math.max(critical, warning, info, 1);
   const rows = [["Critical", critical], ["Warning", warning], ["Info", info]];
-  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [2500, 8300], rows: [new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Severity", 2500), hdrCell("Active Alert Count", 8300)] }), ...rows.map(([label, count], i) => new TableRow({ cantSplit: true, children: [cell(label, { width: 2500, shading: severityColor(label.toUpperCase()), bold: true }), cell(countBar(count, max), { width: 8300, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT })] }))] });
+  return new Table({ layout: TableLayoutType.AUTOFIT, width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [2500, 8300], rows: [new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Severity", 2500), hdrCell("Active Alert Count", 8300)] }), ...rows.map(([label, count], i) => { const bg = i % 2 === 0 ? "FFFFFF" : ROW_ALT; return new TableRow({ cantSplit: true, children: [severityTextCell(label, 2500, bg), cell(countBar(count, max), { width: 8300, shading: bg })] }); })] });
 }
 
 function alertObservationText() {
@@ -6535,7 +6540,7 @@ function cpuHeadroomTable() {
   return twoColTable([
     ["Average Utilization", pct2(D.cpu.average_cpu_usage_pct)],
     ["Peak Utilization", pct2(D.cpu.peak_cpu_usage_pct)],
-    ["Available CPU Headroom", pct2(D.cpu.cpu_headroom_pct)],
+    ["Available CPU Utilization", pct2(D.cpu.cpu_headroom_pct)],
   ], [4200, 6600]);
 }
 
@@ -6617,7 +6622,7 @@ function memoryHeadroomTable() {
   return twoColTable([
     ["Average Utilization", D.memory.average_memory_usage_pct !== "N/A" ? D.memory.average_memory_usage_pct + "%" : "N/A"],
     ["Peak Utilization", D.memory.peak_memory_usage_pct !== "N/A" ? D.memory.peak_memory_usage_pct + "%" : "N/A"],
-    ["Available Memory Headroom", D.memory.memory_headroom_pct !== "N/A" ? D.memory.memory_headroom_pct + "%" : "N/A"],
+    ["Available Memory Utilization", D.memory.memory_headroom_pct !== "N/A" ? D.memory.memory_headroom_pct + "%" : "N/A"],
   ], [4200, 6600]);
 }
 
@@ -6786,7 +6791,7 @@ function peProtectionDomainSection() {
       cell(p.protected_entities || "N/A", { width: CW[3], shading: bg }),
       cell(p.remote_sites || "None", { width: CW[4], shading: bg }),
       cell(String(p.schedule_count ?? 0), { width: CW[5], shading: bg, center: true }),
-      cell(p.state || "Configured", {
+      cell(String(p.state || "Configured").toUpperCase(), {
         width: CW[6], shading: bg, bold: true,
         color: STATUS_COLORS[p.status] || "000000",
       }),
@@ -6846,7 +6851,7 @@ function peRemoteSiteSection() {
             cell(s.addresses || "N/A", { width: CW[2], shading: bg }),
             cell(s.compression || "N/A", { width: CW[3], shading: bg }),
             cell(s.bandwidth_policy || "N/A", { width: CW[4], shading: bg }),
-            cell(s.state || "Configured", { width: CW[5], shading: bg }),
+            cell(String(s.state || "Configured").toUpperCase(), { width: CW[5], shading: bg }),
           ]});
         }),
       ],
@@ -7023,7 +7028,7 @@ function alertTable() {
   D.health.alert_details.forEach((a, i) => {
     const shade = i % 2 === 0 ? "FFFFFF" : ROW_ALT;
     rows.push(new TableRow({ cantSplit: true, children: [
-      cell(a.severity || "UNKNOWN", { width: 1100, shading: severityColor(a.severity), bold: true }),
+      severityTextCell(a.severity || "UNKNOWN", 1100, shade),
       cell(a.title || "Unknown alert", { width: 3900, shading: shade }),
       cell(a.source_host || "N/A", { width: 1500, shading: shade }),
       cell(a.last_occurred ? a.last_occurred.replace("T", " ").replace("Z", " UTC").substring(0, 20) : "N/A", { width: 1500, shading: shade }),
@@ -7155,7 +7160,7 @@ const children = [
   cpuSummaryTable(),
   heading2("CPU Oversubscription"),
   cpuOversubscriptionTable(),
-  heading2("CPU Headroom"),
+  heading2("CPU Utilization"),
   cpuHeadroomTable(),
   pageBreak(),
 
@@ -7180,7 +7185,7 @@ const children = [
   memorySummaryTable(),
   heading2("Memory Allocation Review"),
   memoryAllocationStatusTable(),
-  heading2("Memory Headroom"),
+  heading2("Memory Utilization"),
   memoryHeadroomTable(),
   pageBreak(),
 
