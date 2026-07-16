@@ -2,19 +2,21 @@
 
 `nutanix_health_check.py` connects to Nutanix Prism Central, collects cluster inventory and health data through REST APIs, and generates a Microsoft Word health-check report for each registered cluster.
 
+Current release: **v1.0.0**
+
 ## Report coverage
 
 The report includes:
 
 - Cluster and host inventory
 - Controller VM and user VM inventory
-- Active alerts and NCC findings
+- Active alerts and recommended actions
 - CPU and memory utilization and allocation
 - Network, bond, VLAN, and physical NIC information
 - Storage capacity, container configuration, and encryption
-- Licensing and protection-domain information
+- Licensing, protection domains, protection policies, and recovery plans
 - Security configuration and active security alerts
-- AOS software lifecycle information
+- AOS software lifecycle and current LCM firmware inventory
 
 ## Requirements
 
@@ -26,7 +28,10 @@ The report includes:
   - `OS_Compatibility_Matrix.csv`
   - `NOS_EOL_information_list.csv`
 
-The script installs the Node.js `docx` package locally on its first report run if the package is not already available. Matplotlib is used to generate the CPU, memory, and storage charts.
+The script installs the pinned Node.js `docx` package (`9.7.1`) locally on its
+first report run if that exact version is not already available. Pinning the
+package prevents an upstream release from unexpectedly changing report
+rendering. Matplotlib is used to generate the CPU, memory, and storage charts.
 
 ## Installation
 
@@ -121,8 +126,8 @@ The script automatically searches the project root and `data/` for both required
 
 Depending on the selected mode, the script creates:
 
-- `<cluster>_raw.json`
-- `<cluster>_Health_Check.docx`
+- `<cluster>_raw_YYYY-MM-DD_HH-MM-SS.json`
+- `<cluster>_Health_Check_YYYY-MM-DD_HH-MM-SS.docx`
 - `logs/Nutanix_Health_Check_YYYY-MM-DD_HH-MM-SS.log`
 
 The preflight creates and validates the `logs` folder inside the selected
@@ -133,12 +138,28 @@ safe to use on macOS.
 
 Generated reports, raw captures, temporary report-builder files, Python caches, and local Node.js packages are excluded by `.gitignore`.
 
+## Version and validation
+
+Display the installed script version:
+
+```bash
+python nutanix_health_check.py --version
+```
+
+GitHub Actions validates Python 3.10 through 3.13 by installing the declared
+dependencies, compiling the script, and checking the command-line interface.
+
 ## Data and security considerations
 
 - Raw JSON captures and generated reports can contain infrastructure names, IP addresses, alerts, and other sensitive configuration data. Store and share them appropriately.
 - Review the licensing and redistribution terms for the CSV support files before publishing them in a public repository.
 - Validate recommendations against current Nutanix documentation and your organization's operational requirements before implementing changes.
 
+## License
+
+This project is available under the [MIT License](LICENSE).
+
 ## Project status
 
-The project is under active development. Test changes against representative clusters before using a new revision as the reporting baseline.
+Version 1.0.0 is the first stable reporting baseline. Continue testing future
+changes against representative clusters before promoting a new release.

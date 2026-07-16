@@ -14,7 +14,7 @@ Usage (non-interactive / scripted):
 
 Requirements:
     pip install requests urllib3 matplotlib
-    node  (Node.js 18+ must be installed; docx npm package is auto-installed locally on first run)
+    node  (Node.js 18+ must be installed; the pinned docx npm package is auto-installed locally on first run)
 
     matplotlib is optional but recommended — it generates the 7-day CPU usage chart in the report.
     Without it the chart section is skipped and a text note is shown instead.
@@ -36,6 +36,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import requests
+
+__version__ = "1.0.0"
+DOCX_NPM_VERSION = "9.7.1"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -1658,7 +1661,13 @@ class ClusterDataCollector:
         errors = []
         for label, url, params in attempts:
             try:
-                resp = _req.get(url, auth=auth, verify=False, timeout=20, params=params)
+                resp = _req.get(
+                    url,
+                    auth=auth,
+                    verify=False,
+                    timeout=20,
+                    params=params,
+                )
                 if resp.status_code == 200:
                     payload = resp.json()
                     if self._find_numeric_values(payload, {
@@ -7368,25 +7377,52 @@ _REPORT_JS    = os.path.join(_SCRIPT_DIR, "_report_builder.js")
 
 def _ensure_docx_installed() -> bool:
     """
-    Install the docx package locally (next to this script) if not already
-    present.  Returns True on success, False on failure.
+    Install the pinned docx package locally (next to this script) if the
+    required version is not already present. Returns True on success.
     """
     docx_marker = os.path.join(_NODE_MODULES, "docx", "package.json")
     if os.path.isfile(docx_marker):
-        return True  # already installed
+        try:
+            with open(docx_marker, encoding="utf-8") as f:
+                installed_version = str(json.load(f).get("version", ""))
+            if installed_version == DOCX_NPM_VERSION:
+                return True
+            print(
+                f"    Updating docx npm package from {installed_version or 'unknown'} "
+                f"to pinned version {DOCX_NPM_VERSION} ..."
+            )
+        except (OSError, ValueError):
+            print(f"    Reinstalling pinned docx npm package {DOCX_NPM_VERSION} ...")
+    else:
+        print(
+            f"    Installing docx npm package {DOCX_NPM_VERSION} locally "
+            "(one-time setup) ..."
+        )
 
-    print("    Installing docx npm package locally (one-time setup) ...")
     npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
-    result  = subprocess.run(
-        [npm_cmd, "install", "docx"],
-        cwd=_SCRIPT_DIR,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                npm_cmd,
+                "install",
+                "--no-save",
+                "--no-package-lock",
+                f"docx@{DOCX_NPM_VERSION}",
+            ],
+            cwd=_SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print(
+            "    [ERROR] npm was not found. Install Node.js 18 or later, "
+            "which includes npm."
+        )
+        return False
     if result.returncode != 0:
         print(f"    [ERROR] npm install failed:\n{result.stderr.strip()}")
         return False
-    print("    docx installed successfully.")
+    print(f"    docx {DOCX_NPM_VERSION} installed successfully.")
     return True
 
 
@@ -7619,6 +7655,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Nutanix Health Check – Prism Central Edition (APIv4)"
     )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--host",      help="Prism Central IP or FQDN (skips interactive prompt)")
     p.add_argument("--port",      type=int, default=9440)
     p.add_argument("--user",      help="Prism username (skips interactive prompt)")
