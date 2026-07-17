@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 node_modules/
+vendor/
+build/
+dist/
+*.spec.bak
 _report_builder.js
 reports/
 *_Health_Check.docx

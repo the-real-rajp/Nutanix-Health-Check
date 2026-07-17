@@ -6,7 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- Windows x64 portable application packaging using PyInstaller.
+- Bundled Node.js runtime, pinned `docx` package, support CSV files, and chart dependencies.
+- Windows launcher that writes reports, raw JSON captures, and logs beneath an `output` directory.
+
+### Changed
+
+- Resource discovery now supports both the Python source tree and a frozen Windows application.
+- The generated JavaScript report builder is written to a writable temporary directory.
 
 ## 1.0.0 - 2026-07-16
 

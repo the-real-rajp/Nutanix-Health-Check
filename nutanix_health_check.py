@@ -43,6 +43,16 @@ DOCX_NPM_VERSION = "9.7.1"
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+def _resource_path(*parts: str) -> str:
+    """Return a path inside the source tree or a PyInstaller bundle."""
+    base_dir = getattr(
+        sys,
+        "_MEIPASS",
+        os.path.dirname(os.path.abspath(__file__)),
+    )
+    return os.path.join(base_dir, *parts)
+
+
 OS_COMPAT_CSV_FILENAMES = [
     "OS_Compatibility_Matrix.csv",
     "OS Compatibility Matrix.csv",
@@ -63,11 +73,14 @@ def _support_file_candidate_paths(filenames: list, explicit_path: str = "") -> l
         candidates.append(explicit_path)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    resource_dir = _resource_path()
     search_dirs = [
         os.getcwd(),
         os.path.join(os.getcwd(), "data"),
         script_dir,
         os.path.join(script_dir, "data"),
+        resource_dir,
+        os.path.join(resource_dir, "data"),
         "/mnt/data",
     ]
     for folder in search_dirs:
@@ -7366,13 +7379,24 @@ Packer.toBuffer(doc).then(buf => { fs.writeFileSync(process.argv[3], buf); conso
 """
 
 
-# Persistent directory next to this script where docx is installed locally.
-# Using a local node_modules avoids the Windows global-npm PATH lookup issue
-# where Node cannot find globally installed modules when running scripts from
-# an arbitrary temp directory.
-_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-_NODE_MODULES = os.path.join(_SCRIPT_DIR, "node_modules")
-_REPORT_JS    = os.path.join(_SCRIPT_DIR, "_report_builder.js")
+# Source-mode dependencies live next to this script. A frozen Windows build
+# carries Node.js and node_modules inside the PyInstaller resource directory.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_RESOURCE_DIR = _resource_path()
+_NODE_MODULES = (
+    _resource_path("runtime", "node_modules")
+    if getattr(sys, "frozen", False)
+    else os.path.join(_SCRIPT_DIR, "node_modules")
+)
+_NODE_EXECUTABLE = (
+    _resource_path("runtime", "node", "node.exe")
+    if getattr(sys, "frozen", False)
+    else ("node.exe" if sys.platform == "win32" else "node")
+)
+_REPORT_JS = os.path.join(
+    tempfile.gettempdir(),
+    f"nutanix_health_check_report_builder_{os.getpid()}.js",
+)
 
 
 def _ensure_docx_installed() -> bool:
@@ -7393,6 +7417,12 @@ def _ensure_docx_installed() -> bool:
             )
         except (OSError, ValueError):
             print(f"    Reinstalling pinned docx npm package {DOCX_NPM_VERSION} ...")
+    elif getattr(sys, "frozen", False):
+        print(
+            "    [ERROR] The bundled docx package is missing. "
+            "Rebuild the Windows application."
+        )
+        return False
     else:
         print(
             f"    Installing docx npm package {DOCX_NPM_VERSION} locally "
@@ -7427,7 +7457,7 @@ def _ensure_docx_installed() -> bool:
 
 
 def _write_report_js() -> None:
-    """Write the report builder JS next to this script (overwrite each run)."""
+    """Write the report builder JS to the writable temporary directory."""
     with open(_REPORT_JS, "w", encoding="utf-8") as f:
         f.write(REPORT_JS)
 
@@ -7541,7 +7571,7 @@ def generate_report(findings: dict, output_path: str) -> None:
     if temp_storage_chart_path:
         findings.setdefault("storage", {})["storage_chart_path"] = temp_storage_chart_path
 
-    # Write the JS builder next to this script so node_modules is in scope
+    # Write the JS builder to a writable temporary directory.
     _write_report_js()
 
     # Write findings to a temp JSON file
@@ -7558,8 +7588,8 @@ def generate_report(findings: dict, output_path: str) -> None:
         env["NODE_PATH"] = _NODE_MODULES
 
         result = subprocess.run(
-            ["node", _REPORT_JS, data_file, output_path],
-            cwd=_SCRIPT_DIR,          # <-- run from script dir so node_modules is found
+            [_NODE_EXECUTABLE, _REPORT_JS, data_file, output_path],
+            cwd=_RESOURCE_DIR,
             env=env,
             capture_output=True,
             text=True,
