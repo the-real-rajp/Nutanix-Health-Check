@@ -37,8 +37,27 @@ from typing import Any, Optional
 
 import requests
 
-__version__ = "1.0.0"
+__version__ = "1.1.0-dev"
 DOCX_NPM_VERSION = "9.7.1"
+
+# Stable Nutanix v4 API versions, ordered newest-first by namespace. Preview
+# releases such as v4.0.b1 are intentionally excluded from new primary paths.
+V4_API_VERSIONS = {
+    "clustermgmt": ("v4.2", "v4.1", "v4.0"),
+    "monitoring": ("v4.2", "v4.1", "v4.0"),
+    "vmm": ("v4.2", "v4.1", "v4.0"),
+    "datapolicies": ("v4.2", "v4.1"),
+    "dataprotection": ("v4.2", "v4.1", "v4.0"),
+    "networking": ("v4.3", "v4.2", "v4.1", "v4.0"),
+    "licensing": ("v4.1", "v4.0"),
+    "lifecycle": ("v4.2", "v4.1", "v4.0"),
+    "security": ("v4.1", "v4.0"),
+}
+
+
+def _v4_versions(namespace: str) -> tuple[str, ...]:
+    """Return stable v4 API versions for a namespace, newest first."""
+    return V4_API_VERSIONS.get(namespace, ("v4.2", "v4.1", "v4.0"))
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -469,7 +488,18 @@ class PrismCentralClient:
         PC itself appears as a cluster of type PRISM_CENTRAL — we skip it
         and return only AOS / AHV clusters.
         """
-        raw = self.paginate("/clustermgmt/v4.0/config/clusters")
+        raw = None
+        last_error = None
+        for ver in _v4_versions("clustermgmt"):
+            try:
+                raw = self.paginate(f"/clustermgmt/{ver}/config/clusters")
+                break
+            except Exception as exc:
+                last_error = exc
+        if raw is None:
+            if last_error:
+                raise last_error
+            return []
         clusters = []
         for c in raw:
             cluster_type = (
@@ -489,9 +519,16 @@ class PrismCentralClient:
         Returns the highest working version string, e.g. 'v4.2'.
         Falls back to 'v4.0'.
         """
-        for ver in ["v4.2", "v4.1", "v4.0.b1", "v4.0"]:
+        probe_suffix = {
+            "clustermgmt": "/config/clusters",
+            "networking": "/config/subnets",
+            "monitoring": "/serviceability/alerts",
+            "vmm": "/ahv/config/vms",
+            "lifecycle": "/resources/entities",
+        }.get(namespace, "/config/clusters")
+        for ver in _v4_versions(namespace):
             try:
-                self.get(f"/{namespace}/{ver}/config/clusters", {"$limit": 1})
+                self.get(f"/{namespace}/{ver}{probe_suffix}", {"$limit": 1})
                 return ver
             except Exception:
                 continue
@@ -504,11 +541,13 @@ class PrismCentralClient:
         return m.group(1) if m else "v4.0"
 
     def test_connection(self) -> bool:
-        try:
-            self.get("/clustermgmt/v4.0/config/clusters", {"$limit": 1})
-            return True
-        except Exception:
-            return False
+        for ver in _v4_versions("clustermgmt"):
+            try:
+                self.get(f"/clustermgmt/{ver}/config/clusters", {"$limit": 1})
+                return True
+            except Exception:
+                continue
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -841,32 +880,38 @@ class ClusterDataCollector:
         because PC API versions differ on the exact OData filter path.
         Falls back to fetching all VMs and filtering by cluster UUID client-side.
         """
-        for filt in [
-            f"cluster/extId eq '{self.cluster_ext_id}'",
-            f"clusterExtId eq '{self.cluster_ext_id}'",
-            f"clusterUuid eq '{self.cluster_ext_id}'",
-        ]:
-            try:
-                result = self.client.paginate(
-                    "/vmm/v4.0/ahv/config/vms",
-                    extra_params={"$filter": filt}
-                )
-                if result:
-                    return result
-            except Exception:
-                continue
+        for ver in _v4_versions("vmm"):
+            for filt in [
+                f"cluster/extId eq '{self.cluster_ext_id}'",
+                f"clusterExtId eq '{self.cluster_ext_id}'",
+                f"clusterUuid eq '{self.cluster_ext_id}'",
+            ]:
+                try:
+                    result = self.client.paginate(
+                        f"/vmm/{ver}/ahv/config/vms",
+                        extra_params={"$filter": filt}
+                    )
+                    if result:
+                        print(f"        User VM inventory collected from VMM {ver}.")
+                        return result
+                except Exception:
+                    continue
 
         # Final fallback: fetch all VMs and filter by cluster UUID client-side
-        try:
-            all_vms = self.client.paginate("/vmm/v4.0/ahv/config/vms")
-            return [
-                vm for vm in all_vms
-                if (vm.get("cluster", {}).get("extId") == self.cluster_ext_id or
-                    vm.get("clusterExtId") == self.cluster_ext_id or
-                    vm.get("clusterUuid") == self.cluster_ext_id)
-            ]
-        except Exception:
-            return []
+        for ver in _v4_versions("vmm"):
+            try:
+                all_vms = self.client.paginate(f"/vmm/{ver}/ahv/config/vms")
+                cluster_vms = [
+                    vm for vm in all_vms
+                    if (vm.get("cluster", {}).get("extId") == self.cluster_ext_id or
+                        vm.get("clusterExtId") == self.cluster_ext_id or
+                        vm.get("clusterUuid") == self.cluster_ext_id)
+                ]
+                print(f"        User VM inventory collected from VMM {ver}.")
+                return cluster_vms
+            except Exception:
+                continue
+        return []
 
     def _cvm_virtual_machines(self):
         """
@@ -981,8 +1026,9 @@ class ClusterDataCollector:
 
     def _alerts(self):
         """
-        Fetch active alerts from Prism Central v3 /alerts/list and scope them to
-        this cluster using status.resources.originating_cluster_uuid.
+        Fetch active alerts from the Prism Central Monitoring v4 API and scope
+        them to this cluster. Fall back to PC v3 and PE v2 only when v4 does not
+        return usable results.
 
         Important PC v3 alert fields:
           - status.resources.originating_cluster_uuid
@@ -1012,6 +1058,72 @@ class ClusterDataCollector:
                     continue
                 rendered = rendered.replace("{" + key + "}", _param_value(value))
             return rendered
+
+        def _v4_parameter_map(parameters):
+            """Convert Monitoring v4 Parameter objects into template values."""
+            mapped = {}
+            for item in parameters or []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("paramName") or item.get("name")
+                raw_value = item.get("paramValue", item.get("value"))
+                if not name:
+                    continue
+                if isinstance(raw_value, dict):
+                    value = next(
+                        (
+                            raw_value.get(key)
+                            for key in (
+                                "stringValue", "strValue", "intValue",
+                                "integerValue", "boolValue", "value",
+                            )
+                            if raw_value.get(key) is not None
+                        ),
+                        raw_value,
+                    )
+                else:
+                    value = raw_value
+                mapped[str(name)] = value
+            return mapped
+
+        def _normalise_pc_v4_alert(alert, version):
+            parameters = _v4_parameter_map(alert.get("parameters"))
+            title = _render_template(alert.get("title") or alert.get("message") or "Alert", parameters)
+            message = _render_template(alert.get("message") or title, parameters)
+            source_entity = alert.get("sourceEntity") or {}
+            affected = alert.get("affectedEntities") or []
+            source_name = source_entity.get("name", "") if isinstance(source_entity, dict) else ""
+            if not source_name and affected and isinstance(affected[0], dict):
+                source_name = affected[0].get("name", "")
+
+            resolutions = []
+            for item in alert.get("rootCauseAnalysis") or []:
+                if not isinstance(item, dict):
+                    continue
+                resolution = item.get("resolution") or item.get("detail")
+                if resolution and resolution not in resolutions:
+                    resolutions.append(str(resolution))
+
+            classifications = alert.get("classifications") or []
+            impact_types = alert.get("impactTypes") or []
+            last_updated = alert.get("lastUpdatedTime") or alert.get("creationTime") or ""
+            return {
+                "extId": alert.get("extId", ""),
+                "title": title,
+                "message": message,
+                "severity": str(alert.get("severity") or "UNKNOWN").replace("$", "").upper(),
+                "creationTime": alert.get("creationTime", ""),
+                "lastOccurred": last_updated,
+                "lastUpdateTime": last_updated,
+                "clusterUuid": alert.get("originatingClusterUUID") or alert.get("clusterUUID") or "",
+                "sourceHost": source_name,
+                "sourceEntity": source_name,
+                "sourceType": source_entity.get("type", "") if isinstance(source_entity, dict) else "",
+                "recommendedResolution": " ".join(resolutions) if resolutions else "Review the alert in Prism Central and remediate per Nutanix guidance.",
+                "classification": ", ".join(str(x) for x in classifications) if classifications else "N/A",
+                "impactType": ", ".join(str(x) for x in impact_types) if impact_types else "N/A",
+                "apiSource": f"Monitoring {version}",
+            }
 
         def _normalise_pc_v3_alert(entity):
             resources = entity.get("status", {}).get("resources", {}) if isinstance(entity, dict) else {}
@@ -1054,10 +1166,65 @@ class ClusterDataCollector:
                 "recommendedResolution": recommended_resolution,
                 "classification": ", ".join(str(x) for x in classifications) if classifications else "N/A",
                 "impactType": ", ".join(str(x) for x in impact_types) if impact_types else "N/A",
+                "apiSource": "Prism Central v3",
             }
 
-        # Primary source: Prism Central v3 alerts/list. This is the endpoint that
-        # returned the active alerts during testing.
+        # Preferred source: official Prism Central Monitoring v4 API. Use the
+        # server-side unresolved/cluster filter first, then retry unresolved-only
+        # and apply cluster scoping locally for compatibility.
+        for ver in _v4_versions("monitoring"):
+            filters = [
+                f"isResolved eq false and originatingClusterUUID eq '{self.cluster_ext_id}'",
+                "isResolved eq false",
+            ]
+            for filter_index, alert_filter in enumerate(filters):
+                try:
+                    active = []
+                    page = 0
+                    while True:
+                        response = self.client.get(
+                            f"/monitoring/{ver}/serviceability/alerts",
+                            {
+                                "$page": page,
+                                "$limit": 100,
+                                "$filter": alert_filter,
+                                "$orderby": "lastUpdatedTime desc",
+                            },
+                        )
+                        rows = response.get("data", []) if isinstance(response, dict) else []
+                        if not isinstance(rows, list):
+                            rows = []
+                        for alert in rows:
+                            if not isinstance(alert, dict) or alert.get("isResolved") is True:
+                                continue
+                            cluster_uuid = alert.get("originatingClusterUUID") or alert.get("clusterUUID")
+                            if cluster_uuid == self.cluster_ext_id:
+                                active.append(_normalise_pc_v4_alert(alert, ver))
+
+                        metadata = response.get("metadata", {}) if isinstance(response, dict) else {}
+                        total = metadata.get("totalAvailableResults")
+                        if not rows or len(rows) < 100 or (
+                            isinstance(total, int) and ((page + 1) * 100) >= total
+                        ):
+                            break
+                        page += 1
+
+                    if active:
+                        print(f"        Active alerts collected from Monitoring {ver}.")
+                        return active
+                    # If the cluster-scoped filter is accepted but returns no
+                    # rows, retry unresolved alerts and scope them locally. Some
+                    # PC releases do not apply originatingClusterUUID reliably.
+                    if filter_index == 0:
+                        continue
+                    # A valid empty response may still hide legacy v3 alerts on
+                    # upgraded environments, so try other stable v4 versions and
+                    # ultimately retain the confirmed v3/PE fallbacks.
+                except Exception:
+                    continue
+
+        # Compatibility fallback: Prism Central v3 alerts/list. This remains
+        # necessary for environments where v4 does not surface legacy alerts.
         try:
             all_active = []
             offset = 0
@@ -1116,6 +1283,7 @@ class ClusterDataCollector:
                         "recommendedResolution": e.get("resolution", "Review the alert in Prism Element and remediate per Nutanix guidance."),
                         "classification": e.get("classification", "N/A"),
                         "impactType": e.get("impact_type", "N/A"),
+                        "apiSource": "Prism Element v2",
                     })
                 return normalised
         except Exception as exc:

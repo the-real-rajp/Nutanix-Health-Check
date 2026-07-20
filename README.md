@@ -18,6 +18,9 @@ The report includes:
 - Security configuration and active security alerts
 - AOS software lifecycle and current LCM firmware inventory
 
+The complete API-family and endpoint inventory is documented in
+[`docs/API_VERSION_MATRIX.md`](docs/API_VERSION_MATRIX.md).
+
 ## Requirements
 
 ### Python source distribution
