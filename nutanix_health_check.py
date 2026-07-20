@@ -5615,7 +5615,7 @@ const NUTANIX_BLUE   = "005F9E";
 const NUTANIX_LIGHT  = "D6E8F7";
 const HEADER_GREY    = "404040";
 const ROW_ALT        = "F2F7FB";
-const STATUS_COLORS  = { "Healthy": "00843D", "Recommended": "E5A000", "Critical": "CC0000", "Active": "00843D" };
+const STATUS_COLORS  = { "Healthy": "00843D", "Recommended": "E5A000", "Warning": "E5A000", "Critical": "CC0000", "Info": "4F81BD", "Active": "00843D" };
 const LINK_BLUE = "0563C1";
 const SECTION_BOOKMARKS = {
   "Virtual Machines Summary": "sec_virtual_machines",
@@ -5633,8 +5633,9 @@ const SECTION_BOOKMARKS = {
 function statusRun(status) {
   const raw = String(status || "N/A");
   const key = Object.keys(STATUS_COLORS).find(k => k.toLowerCase() === raw.toLowerCase());
+  const display = raw.toLowerCase() === "recommended" ? "Warning" : raw;
   return new TextRun({
-    text: raw.toUpperCase(),
+    text: display.toUpperCase(),
     bold: true,
     color: key ? STATUS_COLORS[key] : "000000",
     size: REPORT_FONT_SIZE,
@@ -6062,6 +6063,8 @@ function severityTextCell(severity, width, shading) {
     ? "CC0000"
     : upper.includes("WARNING")
     ? "E5A000"
+    : upper.includes("HEALTHY")
+    ? "00843D"
     : upper.includes("INFO")
     ? "4F81BD"
     : "666666";
@@ -6567,39 +6570,6 @@ function severityRank(sev) {
   return 0;
 }
 
-function statusPenalty(status) {
-  if (status === "Critical") return 8;
-  if (status === "Recommended") return 3;
-  return 0;
-}
-
-function executiveHealthScore() {
-  let score = 100;
-  score -= Math.min((D.health.critical_alerts || 0) * 6, 36);
-  score -= Math.min((D.health.warning_alerts || 0) * 3, 18);
-  for (const [_, st] of summaryStatuses) score -= statusPenalty(st);
-  const storagePct = pctNumber(D.storage.disk_utilization_pct);
-  const cpuPct = pctNumber(D.cpu.average_cpu_usage_pct);
-  const memPct = pctNumber(D.memory.average_memory_usage_pct);
-  if (storagePct !== null && storagePct >= 80) score -= 8;
-  if (cpuPct !== null && cpuPct >= 80) score -= 6;
-  if (memPct !== null && memPct >= 80) score -= 6;
-  return Math.max(0, Math.min(100, Math.round(score)));
-}
-
-function scoreLabel(score) {
-  if (score >= 90) return "Healthy";
-  if (score >= 75) return "Healthy with Recommendations";
-  if (score >= 60) return "Needs Attention";
-  return "Action Required";
-}
-
-function scoreStatus(score) {
-  if (score >= 90) return "Healthy";
-  if (score >= 70) return "Recommended";
-  return "Critical";
-}
-
 function barText(pct, blocks = 10) {
   const n = pctNumber(pct);
   if (n === null) return "N/A";
@@ -6618,22 +6588,6 @@ function severityColor(sev) {
   if (s.includes("WARNING")) return "FFF3CD";
   if (s.includes("INFO")) return "D6E8F7";
   return "FFFFFF";
-}
-
-function executiveHealthScoreTable() {
-  const score = executiveHealthScore();
-  const label = scoreLabel(score);
-  const status = scoreStatus(score);
-  return new Table({
-    layout: TableLayoutType.AUTOFIT,
-    width: { size: CONTENT_WIDTH, type: WidthType.DXA }, columnWidths: [3600, 7200],
-    rows: [
-      new TableRow({ cantSplit: true, children: [
-        new TableCell({ borders: BORDERS, shading: { fill: NUTANIX_BLUE, type: ShadingType.CLEAR }, margins: { top: 180, bottom: 180, left: 160, right: 160 }, width: { size: 3600, type: WidthType.DXA }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: String(score), font: REPORT_FONT, bold: true, size: 72, color: "FFFFFF" })] }), new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "/ 100", font: REPORT_FONT, bold: true, size: 22, color: "FFFFFF" })] })] }),
-        new TableCell({ borders: BORDERS, margins: { top: 180, bottom: 180, left: 180, right: 180 }, width: { size: 7200, type: WidthType.DXA }, children: [new Paragraph({ children: [new TextRun({ text: label, font: REPORT_FONT, bold: true, size: H2_SIZE, color: STATUS_COLORS[status] || HEADER_GREY })], spacing: { after: PARA_AFTER } }), new Paragraph({ children: [new TextRun({ text: `Critical alerts: ${D.health.critical_alerts || 0}    Warnings: ${D.health.warning_alerts || 0}    Total active alerts: ${D.health.total_alerts || 0}`, font: REPORT_FONT, size: REPORT_FONT_SIZE })] }), new Paragraph({ children: [new TextRun({ text: "Score is calculated from active alerts, section statuses, and capacity/performance thresholds.", font: REPORT_FONT, size: REPORT_FONT_SIZE, italics: true, color: HEADER_GREY })] })] }),
-      ]}),
-    ],
-  });
 }
 
 function healthCategoryTable() {
@@ -6819,17 +6773,18 @@ function memoryHeadroomTable() {
 function assessmentStatusTable() {
   const rows = [
     ["Healthy", "No recommendations required."],
-    ["Recommended", "Apply during the next maintenance window."],
-    ["Critical", "Apply as soon as possible."],
+    ["Warning", "Review the finding and plan remediation during the next appropriate maintenance window."],
+    ["Critical", "Immediate attention is required. Review and remediate as soon as possible."],
+    ["Info", "Informational observation. No immediate remediation is required."],
   ];
   return new Table({
     layout: TableLayoutType.AUTOFIT,
     width: { size: CONTENT_WIDTH, type: WidthType.DXA },
     columnWidths: [3000, 7800],
     rows: [
-      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Status", 3000), hdrCell("Guidance", 7800)] }),
-      ...rows.map(([status, guidance], i) => new TableRow({ cantSplit: true, children: [
-        new TableCell({ borders: BORDERS, margins: { top: 60, bottom: 60, left: 120, right: 120 }, width: { size: 3000, type: WidthType.DXA }, shading: { fill: i % 2 === 0 ? "FFFFFF" : ROW_ALT, type: ShadingType.CLEAR }, children: [new Paragraph({ children: [statusRun(status)], spacing: { before: 0, after: 0 } })] }),
+      new TableRow({ tableHeader: true, cantSplit: true, children: [hdrCell("Status / Severity", 3000), hdrCell("Guidance", 7800)] }),
+      ...rows.map(([severity, guidance], i) => new TableRow({ cantSplit: true, children: [
+        severityTextCell(severity, 3000, i % 2 === 0 ? "FFFFFF" : ROW_ALT),
         cell(guidance, { width: 7800, shading: i % 2 === 0 ? "FFFFFF" : ROW_ALT }),
       ]}))
     ],
@@ -7256,10 +7211,10 @@ const children = [
   bulletItem("Provide recommendations for improvement."),
   compactHeading2("Assessment Summary"),
   summaryTable(),
-  compactHeading2("Overall Health Score"),
-  executiveHealthScoreTable(),
   compactHeading2("Health Assessment by Category"),
   healthCategoryTable(),
+  compactHeading2("Alert Severity Summary"),
+  alertSeveritySummaryTable(),
   compactHeading2("Resource Utilization Summary"),
   capacityDashboardTable(),
   pageBreak(),
@@ -7306,8 +7261,6 @@ const children = [
   // ALERTS
   heading1("Alerts Summary"),
   alertOverviewTable(),
-  heading2("Alert Severity Summary"),
-  alertSeveritySummaryTable(),
   heading2("Recommended Actions"),
   body("The following action list consolidates active alerts into an operational checklist."),
   recommendedActionsTable(),
