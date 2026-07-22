@@ -32,6 +32,7 @@ The complete API-family and endpoint inventory is documented in
 - The support files in [`data/`](data/):
   - `OS_Compatibility_Matrix.csv`
   - `NOS_EOL_information_list.csv`
+- The report logo at `images/winslow-technology-group-logo.png`
 
 The script installs the pinned Node.js `docx` package (`9.7.1`) locally on its
 first report run if that exact version is not already available. Pinning the
@@ -100,6 +101,7 @@ The script starts with **Preflight Validation**. Before requesting Prism Central
 
 - `data/OS_Compatibility_Matrix.csv`
 - `data/NOS_EOL_information_list.csv`
+- `images/winslow-technology-group-logo.png`
 
 A successful preflight looks similar to:
 
@@ -112,6 +114,7 @@ Checking required support files...
 
   [OK] OS_Compatibility_Matrix.csv
   [OK] NOS_EOL_information_list.csv
+  [OK] winslow-technology-group-logo.png
 
 All required support files found.
 Proceeding to Prism Central connection...
@@ -127,7 +130,7 @@ After validation, the script interactively prompts for:
 
 The script then tests the Prism Central connection, discovers registered clusters, collects each cluster's data, and generates the raw JSON and Word health-check report.
 
-If either CSV is missing, preflight stops before any connection information is requested and lists the expected filename.
+If a required CSV or the report logo is missing, preflight stops before any connection information is requested and lists the expected filename.
 
 ### Optional command-line mode
 
@@ -154,7 +157,7 @@ python nutanix_health_check.py \
   --output-dir reports
 ```
 
-The script automatically searches the project root and `data/` for both required CSV files. Custom paths can be supplied with:
+The script automatically searches the project root and `data/` for both required CSV files. The report logo is loaded from `images/` beside the script or from the bundled Windows resources. Custom CSV paths can be supplied with:
 
 ```bash
 --os-compat-csv /path/to/OS_Compatibility_Matrix.csv

@@ -84,6 +84,9 @@ AOS_EOL_CSV_FILENAMES = [
     "nos_eol_information_list.csv",
 ]
 
+REPORT_LOGO_FILENAME = "winslow-technology-group-logo.png"
+REPORT_LOGO_PATH = _resource_path("images", REPORT_LOGO_FILENAME)
+
 
 def _support_file_candidate_paths(filenames: list, explicit_path: str = "") -> list:
     """Build a deduplicated list of candidate support-file paths."""
@@ -5592,6 +5595,8 @@ const {
 const fs = require('fs');
 
 const DATA = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const REPORT_LOGO_PATH = process.argv[4];
+const HAS_REPORT_LOGO = Boolean(REPORT_LOGO_PATH && fs.existsSync(REPORT_LOGO_PATH));
 
 // Standard report layout settings
 const REPORT_FONT = "Calibri";       // Change to "Calibri" if broader compatibility is needed
@@ -5607,6 +5612,7 @@ const PARA_AFTER = 120;            // 6 pt in twips
 const COMPACT_AFTER = 40;           // 2 pt in twips
 const TIGHT_AFTER = 0;              // no extra spacing
 const PAGE_MARGIN = 720;           // 0.5 inch in twips
+const PAGE_TOP_MARGIN = 1080;      // 0.75 inch to accommodate the branded header
 const HEADER_FOOTER_DISTANCE = 432; // 0.3 inch in twips
 // Table rows use cantSplit to prevent row content from being divided across pages.
 // Header rows use tableHeader so Word repeats column headers on continuation pages.
@@ -7471,25 +7477,77 @@ const doc = new Document({
     ],
   },
   sections: [{
-    properties: { page: { size: { width: 12240, height: 15840 }, margin: { top: PAGE_MARGIN, right: PAGE_MARGIN, bottom: PAGE_MARGIN, left: PAGE_MARGIN, header: HEADER_FOOTER_DISTANCE, footer: HEADER_FOOTER_DISTANCE } } },
-    headers: { default: { options: { children: [new Paragraph({
-      children: [
-        new TextRun({ text: `Nutanix Health Check – ${C.cluster_name} – ${D.customer}`, font: REPORT_FONT, size: TABLE_FONT_SIZE, color: HEADER_GREY }),
-        new TextRun({ text: "\t" }), new TextRun({ text: D.date, font: REPORT_FONT, size: TABLE_FONT_SIZE, color: HEADER_GREY }),
-      ],
-      tabStops: [{ type: "right", position: 10800 }],
-      border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: NUTANIX_BLUE, space: 4 } },
+    properties: { page: { size: { width: 12240, height: 15840 }, margin: { top: PAGE_TOP_MARGIN, right: PAGE_MARGIN, bottom: PAGE_MARGIN, left: PAGE_MARGIN, header: HEADER_FOOTER_DISTANCE, footer: HEADER_FOOTER_DISTANCE } } },
+    headers: { default: { options: { children: [new Table({
+      layout: TableLayoutType.FIXED,
+      width: { size: CONTENT_WIDTH, type: WidthType.DXA },
+      columnWidths: [2300, 6200, 2300],
+      rows: [new TableRow({ cantSplit: true, children: [
+        new TableCell({
+          width: { size: 2300, type: WidthType.DXA },
+          verticalAlign: VerticalAlign.CENTER,
+          margins: { top: 0, bottom: 40, left: 0, right: 100 },
+          borders: {
+            top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            bottom: { style: BorderStyle.SINGLE, size: 6, color: NUTANIX_BLUE },
+          },
+          children: [new Paragraph({
+            alignment: AlignmentType.LEFT,
+            spacing: { before: 0, after: 0 },
+            children: HAS_REPORT_LOGO ? [new ImageRun({
+              data: fs.readFileSync(REPORT_LOGO_PATH),
+              transformation: { width: 140, height: 43 },
+              type: "png",
+            })] : [],
+          })],
+        }),
+        new TableCell({
+          width: { size: 6200, type: WidthType.DXA },
+          verticalAlign: VerticalAlign.CENTER,
+          margins: { top: 0, bottom: 40, left: 100, right: 100 },
+          borders: {
+            top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            bottom: { style: BorderStyle.SINGLE, size: 6, color: NUTANIX_BLUE },
+          },
+          children: [new Paragraph({
+            spacing: { before: 0, after: 0 },
+            children: [new TextRun({ text: `Nutanix Health Check – ${C.cluster_name} – ${D.customer}`, font: REPORT_FONT, size: 16, color: HEADER_GREY })],
+          })],
+        }),
+        new TableCell({
+          width: { size: 2300, type: WidthType.DXA },
+          verticalAlign: VerticalAlign.CENTER,
+          margins: { top: 0, bottom: 40, left: 100, right: 0 },
+          borders: {
+            top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            bottom: { style: BorderStyle.SINGLE, size: 6, color: NUTANIX_BLUE },
+          },
+          children: [new Paragraph({
+            alignment: AlignmentType.RIGHT,
+            spacing: { before: 0, after: 0 },
+            children: [new TextRun({ text: D.date, font: REPORT_FONT, size: TABLE_FONT_SIZE, color: HEADER_GREY })],
+          })],
+        }),
+      ]})],
     })] } } },
     footers: { default: { options: { children: [new Paragraph({
       children: [
         new TextRun({ text: "Confidential", font: REPORT_FONT, size: TABLE_FONT_SIZE, italics: true, color: "888888" }),
+        new TextRun({ text: "\t" }),
+        new TextRun({ text: "©2026 Winslow Tech Group. All Right Reserved", font: REPORT_FONT, size: 16, color: HEADER_GREY }),
         new TextRun({ text: "\t" }),
         new TextRun({ text: "Page ", font: REPORT_FONT, size: TABLE_FONT_SIZE, color: HEADER_GREY }),
         new TextRun({ children: [PageNumber.CURRENT], font: REPORT_FONT, size: 18 }),
         new TextRun({ text: " of ", font: REPORT_FONT, size: TABLE_FONT_SIZE, color: HEADER_GREY }),
         new TextRun({ children: [PageNumber.TOTAL_PAGES], font: REPORT_FONT, size: 18 }),
       ],
-      tabStops: [{ type: "right", position: 10800 }],
+      tabStops: [{ type: "center", position: 5400 }, { type: "right", position: 10800 }],
       border: { top: { style: BorderStyle.SINGLE, size: 4, color: NUTANIX_BLUE, space: 4 } },
     })] } } },
     children,
@@ -7709,7 +7767,7 @@ def generate_report(findings: dict, output_path: str) -> None:
         env["NODE_PATH"] = _NODE_MODULES
 
         result = subprocess.run(
-            [_NODE_EXECUTABLE, _REPORT_JS, data_file, output_path],
+            [_NODE_EXECUTABLE, _REPORT_JS, data_file, output_path, REPORT_LOGO_PATH],
             cwd=_RESOURCE_DIR,
             env=env,
             capture_output=True,
@@ -7863,11 +7921,17 @@ def preflight_required_support_files(args: argparse.Namespace) -> None:
             missing.append((label, filenames))
             print(f"  [MISSING] {filenames[0]}")
 
+    if os.path.isfile(REPORT_LOGO_PATH):
+        print(f"  [OK] {REPORT_LOGO_FILENAME}")
+    else:
+        missing.append(("Winslow Tech Group report logo", [REPORT_LOGO_FILENAME]))
+        print(f"  [MISSING] {REPORT_LOGO_FILENAME}")
+
     if missing:
         print()
-        print("ERROR: Required support files are missing.")
+        print("ERROR: Required report support files are missing.")
         print()
-        print("Place the missing CSV files in the same folder as this script and run the health check again.")
+        print("Place the missing CSV files under data/ and the report logo under images/, then run the health check again.")
         print()
         print("Expected files:")
         for _, filenames in missing:
