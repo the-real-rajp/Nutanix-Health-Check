@@ -18,9 +18,6 @@ The report includes:
 - Security configuration and active security alerts
 - AOS software lifecycle and current LCM firmware inventory
 
-The complete API-family and endpoint inventory is documented in
-[`docs/API_VERSION_MATRIX.md`](docs/API_VERSION_MATRIX.md).
-
 ## Requirements
 
 ### Python source distribution
@@ -29,12 +26,9 @@ The complete API-family and endpoint inventory is documented in
 - Node.js 18 or later
 - Network access to Prism Central on port `9440`
 - A Prism Central account with permission to read the required inventory and statistics
-- HTTPS access to the Nutanix Support Portal for current AOS, Prism Central,
-  and Nutanix Files lifecycle information and guest-OS compatibility data
-- Optional offline CSV fallbacks in [`data/`](data/):
+- The support files in [`data/`](data/):
   - `OS_Compatibility_Matrix.csv`
   - `NOS_EOL_information_list.csv`
-- HTTPS access to the GitHub-hosted report logo; a bundled copy under `images/` is used automatically if the download is unavailable
 
 The script installs the pinned Node.js `docx` package (`9.7.1`) locally on its
 first report run if that exact version is not already available. Pinning the
@@ -44,7 +38,7 @@ rendering. Matplotlib is used to generate the CPU, memory, and storage charts.
 ### Windows portable distribution
 
 The Windows x64 release is self-contained and does not require Python,
-Node.js, npm, or the support CSV fallbacks to be installed separately. Download
+Node.js, npm, or the support CSV files to be installed separately. Download
 `Nutanix-Health-Check-1.0.0-Windows-x64.zip` from the GitHub release, extract
 the complete archive, and run `Run-Nutanix-Health-Check.cmd`. Reports, raw JSON
 captures, and logs are written beneath the extracted `output` directory.
@@ -99,16 +93,10 @@ Run the script without arguments:
 python nutanix_health_check.py
 ```
 
-The script starts with **Preflight Validation**. Before requesting Prism Central credentials, it confirms that current report-support data is available from:
+The script starts with **Preflight Validation**. Before requesting Prism Central credentials, it confirms that these required support files are available:
 
-- [Nutanix End of Support Life Information - Software Releases](https://portal.nutanix.com/page/documents/eol/list?type=aos)
-- [Prism Central End of Support Life Information](https://portal.nutanix.com/page/documents/eol/list?type=pc)
-- [Nutanix Files End of Support Life Information](https://portal.nutanix.com/page/documents/eol/list?type=files)
-- [Nutanix Guest OS Compatibility Matrix](https://portal.nutanix.com/page/compatibility-interoperability-matrix/guestos/compatibility)
-- Winslow Technology Group report logo from the configured GitHub URL, with `images/winslow-technology-group-logo.png` as its fallback
-
-If either Nutanix portal API is unavailable, the script automatically uses its
-packaged CSV fallback under `data/`.
+- `data/OS_Compatibility_Matrix.csv`
+- `data/NOS_EOL_information_list.csv`
 
 A successful preflight looks similar to:
 
@@ -117,15 +105,12 @@ A successful preflight looks similar to:
 Nutanix Health Check - Preflight Validation
 ------------------------------------------------------------
 
-Checking report support data...
+Checking required support files...
 
-  [OK] Guest OS compatibility data (Nutanix Support Portal)
-  [OK] AOS lifecycle data (Nutanix Support Portal)
-  [OK] Prism Central lifecycle data (Nutanix Support Portal)
-  [OK] Nutanix Files lifecycle data (Nutanix Support Portal)
-  [OK] Report logo downloaded from https://raw.githubusercontent.com/...
+  [OK] OS_Compatibility_Matrix.csv
+  [OK] NOS_EOL_information_list.csv
 
-All report support data is available.
+All required support files found.
 Proceeding to Prism Central connection...
 ```
 
@@ -139,11 +124,7 @@ After validation, the script interactively prompts for:
 
 The script then tests the Prism Central connection, discovers registered clusters, collects each cluster's data, and generates the raw JSON and Word health-check report.
 
-If AOS or guest-OS portal data and its corresponding CSV fallback are both
-unavailable, or the report logo is unavailable from both the web and bundled
-fallback, preflight stops before requesting connection information. Prism
-Central and Files lifecycle lookups are optional and produce a warning when
-their portal data cannot be reached.
+If either CSV is missing, preflight stops before any connection information is requested and lists the expected filename.
 
 ### Optional command-line mode
 
@@ -170,13 +151,7 @@ python nutanix_health_check.py \
   --output-dir reports
 ```
 
-The script retrieves AOS, Prism Central, and Nutanix Files lifecycle data and
-guest-OS compatibility data from the official Nutanix Support Portal APIs. It automatically searches the project
-root and `data/` for offline CSV fallbacks. During report generation it
-downloads the report logo from GitHub and embeds it in the DOCX; the completed
-report does not depend on the URL when opened. If the download fails, the
-script uses the copy under `images/` or the bundled Windows resources. Custom
-fallback CSV paths can be supplied with:
+The script automatically searches the project root and `data/` for both required CSV files. Custom paths can be supplied with:
 
 ```bash
 --os-compat-csv /path/to/OS_Compatibility_Matrix.csv
@@ -213,7 +188,7 @@ dependencies, compiling the script, and checking the command-line interface.
 ## Data and security considerations
 
 - Raw JSON captures and generated reports can contain infrastructure names, IP addresses, alerts, and other sensitive configuration data. Store and share them appropriately.
-- Lifecycle and compatibility data is read from the official Nutanix Support Portal; packaged AOS and guest-OS CSV files are offline fallbacks and should be refreshed periodically.
+- Review the licensing and redistribution terms for the CSV support files before publishing them in a public repository.
 - Validate recommendations against current Nutanix documentation and your organization's operational requirements before implementing changes.
 
 ## License

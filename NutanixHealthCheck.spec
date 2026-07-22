@@ -15,7 +15,6 @@ a = Analysis(
     ] + matplotlib_binaries,
     datas=[
         ("data", "data"),
-        ("images", "images"),
         ("vendor/node-runtime/node_modules", "runtime/node_modules"),
     ] + matplotlib_datas,
     hiddenimports=matplotlib_hiddenimports,
