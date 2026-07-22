@@ -51,6 +51,7 @@ V4_API_VERSIONS = {
     "networking": ("v4.3", "v4.2", "v4.1", "v4.0"),
     "licensing": ("v4.1", "v4.0"),
     "lifecycle": ("v4.2", "v4.1", "v4.0"),
+    "prism": ("v4.2", "v4.1", "v4.0"),
     "security": ("v4.1", "v4.0"),
 }
 
@@ -84,8 +85,78 @@ AOS_EOL_CSV_FILENAMES = [
     "nos_eol_information_list.csv",
 ]
 
+NUTANIX_AOS_EOL_PAGE_URL = "https://portal.nutanix.com/page/documents/eol/list?type=aos"
+NUTANIX_EOL_API_URL = "https://portal.nutanix.com/api/v1/eol/find"
+NUTANIX_PC_EOL_PAGE_URL = "https://portal.nutanix.com/page/documents/eol/list?type=pc"
+NUTANIX_FILES_EOL_PAGE_URL = "https://portal.nutanix.com/page/documents/eol/list?type=files"
+NUTANIX_EOL_API_SOURCES = {
+    "aos": {"type": "aos", "product_type": "NOS", "label": "AOS"},
+    "pc": {"type": "pc", "product_type": "PC", "label": "Prism Central"},
+    "files": {"type": "files", "product_type": "FILES", "label": "Nutanix Files"},
+}
+NUTANIX_GUEST_OS_PAGE_URL = (
+    "https://portal.nutanix.com/page/compatibility-interoperability-matrix/"
+    "guestos/compatibility"
+)
+NUTANIX_GUEST_OS_API_URL = (
+    "https://portal.nutanix.com/api/v1/compatibilitymatrixguestos"
+)
+_NUTANIX_SUPPORT_DATA_CACHE = {}
+
 REPORT_LOGO_FILENAME = "winslow-technology-group-logo.png"
-REPORT_LOGO_PATH = _resource_path("images", REPORT_LOGO_FILENAME)
+REPORT_LOGO_URL = (
+    "https://raw.githubusercontent.com/the-real-rajp/"
+    "Nutanix-Health-Check/develop/v1.1.0/images/"
+    f"{REPORT_LOGO_FILENAME}"
+)
+REPORT_LOGO_FALLBACK_PATH = _resource_path("images", REPORT_LOGO_FILENAME)
+_REPORT_LOGO_CACHE_PATH = ""
+
+
+def _cleanup_downloaded_report_logo() -> None:
+    """Remove the temporary web-downloaded report logo, if one was created."""
+    global _REPORT_LOGO_CACHE_PATH
+    if _REPORT_LOGO_CACHE_PATH:
+        try:
+            os.unlink(_REPORT_LOGO_CACHE_PATH)
+        except OSError:
+            pass
+        _REPORT_LOGO_CACHE_PATH = ""
+
+
+def _resolve_report_logo() -> tuple[str, str]:
+    """Download the report logo and fall back to the bundled copy if needed."""
+    global _REPORT_LOGO_CACHE_PATH
+
+    if _REPORT_LOGO_CACHE_PATH and os.path.isfile(_REPORT_LOGO_CACHE_PATH):
+        return _REPORT_LOGO_CACHE_PATH, "web"
+
+    try:
+        response = requests.get(REPORT_LOGO_URL, timeout=20)
+        response.raise_for_status()
+        if not response.content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("downloaded content is not a PNG image")
+
+        fd, logo_path = tempfile.mkstemp(prefix="nutanix_health_check_logo_", suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as logo_file:
+                logo_file.write(response.content)
+        except Exception:
+            try:
+                os.unlink(logo_path)
+            except OSError:
+                pass
+            raise
+
+        _REPORT_LOGO_CACHE_PATH = logo_path
+        atexit.register(_cleanup_downloaded_report_logo)
+        return logo_path, "web"
+    except (requests.RequestException, OSError, ValueError):
+        if os.path.isfile(REPORT_LOGO_FALLBACK_PATH):
+            return REPORT_LOGO_FALLBACK_PATH, "bundled fallback"
+        raise RuntimeError(
+            "The report logo could not be downloaded and the bundled fallback is missing."
+        )
 
 
 def _support_file_candidate_paths(filenames: list, explicit_path: str = "") -> list:
@@ -121,22 +192,8 @@ def _find_optional_file(filename, explicit_path: str = "") -> str:
     return ""
 
 
-def _find_required_file(label: str, filename, explicit_path: str = "") -> str:
-    """Return a required supporting file path or raise a clear, actionable error."""
-    filenames = filename if isinstance(filename, list) else [filename]
-    found = _find_optional_file(filenames, explicit_path)
-    if found:
-        return found
-
-    expected = "\n  - ".join(filenames)
-    raise FileNotFoundError(
-        f"Missing required {label}.\n"
-        f"Expected one of:\n  - {expected}"
-    )
-
-
 def _parse_iso_date(value: str) -> Optional[datetime]:
-    """Parse Nutanix CSV ISO timestamp values into timezone-aware datetimes."""
+    """Parse Nutanix ISO timestamp values into timezone-aware datetimes."""
     if not value:
         return None
     try:
@@ -181,32 +238,97 @@ def _normalise_os_name(value: str) -> str:
     return s
 
 
-def _load_os_compatibility_matrix(path: str, aos_version: str) -> dict:
-    """Load OS compatibility entries for the current AOS minor train."""
-    matrix = {}
+def _download_nutanix_support_json(cache_key: str, url: str, params: Optional[dict] = None) -> Any:
+    """Download and cache public Nutanix Support Portal JSON data."""
+    if cache_key in _NUTANIX_SUPPORT_DATA_CACHE:
+        return _NUTANIX_SUPPORT_DATA_CACHE[cache_key]
+    response = requests.get(
+        url,
+        params=params,
+        headers={"Accept": "application/json", "User-Agent": "Nutanix-Health-Check"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    _NUTANIX_SUPPORT_DATA_CACHE[cache_key] = payload
+    return payload
+
+
+def _csv_os_compatibility_entries(path: str) -> list:
+    """Read the packaged guest-OS compatibility CSV fallback."""
     if not path or not os.path.exists(path):
-        return matrix
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    header_idx = next(
+        (i for i, row in enumerate(rows) if row and row[0].strip() == "AOS Version"),
+        None,
+    )
+    if header_idx is None:
+        return []
+    headers = [h.strip() for h in rows[header_idx]]
+    idx = {h: n for n, h in enumerate(headers)}
+    entries = []
+    for row in rows[header_idx + 1:]:
+        def get(column):
+            position = idx.get(column)
+            return row[position].strip() if position is not None and position < len(row) else ""
+        entries.append({
+            "aos_version": get("AOS Version"),
+            "os_family": get("OS Family"),
+            "os_status": get("OS Status"),
+        })
+    return entries
+
+
+def _get_os_compatibility_entries(fallback_path: str = "") -> tuple[list, str]:
+    """Return live Nutanix guest-OS compatibility data or the CSV fallback."""
+    try:
+        payload = _download_nutanix_support_json(
+            "guest_os_compatibility",
+            NUTANIX_GUEST_OS_API_URL,
+        )
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("the compatibility API returned no entries")
+        entries = [
+            {
+                "aos_version": str(item.get("AOSVersion") or "").strip(),
+                "os_family": str(item.get("OSReleaseFamily") or "").strip(),
+                "os_status": str(item.get("OSSupportStatus") or "").strip(),
+            }
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        if not any(item["aos_version"] and item["os_family"] for item in entries):
+            raise ValueError("the compatibility API response did not contain usable entries")
+        return entries, "Nutanix Support Portal"
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        try:
+            entries = _csv_os_compatibility_entries(fallback_path)
+        except (OSError, csv.Error) as csv_exc:
+            raise RuntimeError(
+                f"Guest OS compatibility data is unavailable ({exc}); CSV fallback failed ({csv_exc})."
+            ) from csv_exc
+        if entries:
+            return entries, "bundled CSV fallback"
+        raise RuntimeError(
+            f"Guest OS compatibility data is unavailable from the Nutanix Support Portal ({exc}) "
+            "and no CSV fallback was found."
+        ) from exc
+
+
+def _load_os_compatibility_matrix(path: str, aos_version: str) -> dict:
+    """Load OS compatibility entries from Nutanix, with a CSV fallback."""
+    matrix = {}
     aos_minor = _aos_minor_version(aos_version)
     target = f"AOS {aos_minor}".strip()
     try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.reader(f))
-        header_idx = None
-        for i, row in enumerate(rows):
-            if row and row[0].strip() == "AOS Version":
-                header_idx = i
-                break
-        if header_idx is None:
-            return matrix
-        headers = [h.strip() for h in rows[header_idx]]
-        idx = {h: n for n, h in enumerate(headers)}
-        for row in rows[header_idx + 1:]:
-            if len(row) <= max(idx.get("AOS Version", 0), idx.get("OS Family", 0), idx.get("OS Status", 0)):
+        entries, _ = _get_os_compatibility_entries(path)
+        for entry in entries:
+            if entry.get("aos_version") != target:
                 continue
-            if row[idx["AOS Version"]].strip() != target:
-                continue
-            os_family = row[idx["OS Family"]].strip()
-            os_status = row[idx["OS Status"]].strip() or "-"
+            os_family = entry.get("os_family", "").strip()
+            os_status = entry.get("os_status", "").strip() or "-"
             if not os_family:
                 continue
             report_status = "Legacy Support" if os_status.lower().startswith("legacy") else "Supported"
@@ -215,9 +337,167 @@ def _load_os_compatibility_matrix(path: str, aos_version: str) -> dict:
                 "csv_status": os_status,
                 "support": report_status,
             }
-    except Exception as exc:
-        print(f"    [WARN] Could not read OS compatibility matrix {path}: {exc}")
+    except RuntimeError as exc:
+        print(f"    [WARN] {exc}")
     return matrix
+
+
+def _csv_aos_eol_entries(path: str) -> list:
+    """Read the packaged AOS lifecycle CSV fallback."""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    header_idx = next(
+        (i for i, row in enumerate(rows) if row and row[0].strip() == "AOS Version"),
+        None,
+    )
+    if header_idx is None:
+        return []
+    headers = [h.strip() for h in rows[header_idx]]
+    idx = {h: n for n, h in enumerate(headers)}
+    entries = []
+    for row in rows[header_idx + 1:]:
+        if not row or not row[0].strip():
+            continue
+        def get(column):
+            position = idx.get(column)
+            return row[position].strip() if position is not None and position < len(row) else ""
+        entries.append({
+            "version": get("AOS Version"),
+            "ga_date": get("GA Date"),
+            "eom": get("End of Maintenance"),
+            "eos": get("End of Support Life"),
+            "latest": get("Latest Version"),
+            "note": get("Note"),
+        })
+    return entries
+
+
+def _get_product_eol_entries(product: str, fallback_path: str = "") -> tuple[list, str]:
+    """Return live Nutanix lifecycle data for AOS, PC, or Files."""
+    source = NUTANIX_EOL_API_SOURCES.get(product)
+    if not source:
+        raise ValueError(f"Unsupported Nutanix lifecycle product: {product}")
+    try:
+        payload = _download_nutanix_support_json(
+            f"{product}_eol",
+            NUTANIX_EOL_API_URL,
+            params={"type": source["type"], "productType": source["product_type"]},
+        )
+        contents = payload.get("contents") if isinstance(payload, dict) else None
+        if not isinstance(contents, list) or not contents:
+            raise ValueError(f"the {source['label']} lifecycle API returned no entries")
+        entries = [
+            {
+                "version": str(item.get("version") or "").strip(),
+                "ga_date": str(item.get("GENERAL_AVAILABILITY") or "").strip(),
+                "eom": str(item.get("END_OF_MAINTENANCE") or "").strip(),
+                "eos": str(item.get("END_OF_SUPPORT_LIFE") or "").strip(),
+                "latest": "",
+                "note": "",
+            }
+            for item in contents
+            if isinstance(item, dict) and item.get("version")
+        ]
+        if not entries:
+            raise ValueError(
+                f"the {source['label']} lifecycle API response did not contain usable entries"
+            )
+        return entries, "Nutanix Support Portal"
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        if product != "aos":
+            raise RuntimeError(
+                f"{source['label']} lifecycle data is unavailable from the "
+                f"Nutanix Support Portal ({exc})."
+            ) from exc
+        try:
+            entries = _csv_aos_eol_entries(fallback_path)
+        except (OSError, csv.Error) as csv_exc:
+            raise RuntimeError(
+                f"AOS lifecycle data is unavailable ({exc}); CSV fallback failed ({csv_exc})."
+            ) from csv_exc
+        if entries:
+            return entries, "bundled CSV fallback"
+        raise RuntimeError(
+            f"AOS lifecycle data is unavailable from the Nutanix Support Portal ({exc}) "
+            "and no CSV fallback was found."
+        ) from exc
+
+
+def _get_aos_eol_entries(fallback_path: str = "") -> tuple[list, str]:
+    """Return live Nutanix AOS lifecycle data or the CSV fallback."""
+    return _get_product_eol_entries("aos", fallback_path)
+
+
+def _normalise_product_version(value: str, product: str) -> str:
+    """Normalise installed versions for Support Portal lifecycle matching."""
+    version = str(value or "").strip().lower()
+    if product == "pc" and version.startswith("pc."):
+        version = version[3:]
+    return version
+
+
+def _load_product_eol_info(product: str, installed_version: str) -> dict:
+    """Match an installed Prism Central or Files version to lifecycle data."""
+    source = NUTANIX_EOL_API_SOURCES[product]
+    result = {
+        "product": source["label"],
+        "current_version": installed_version or "N/A",
+        "matched_version": "N/A",
+        "end_of_maintenance": "N/A",
+        "end_of_support_life": "N/A",
+        "lifecycle_status": "Unknown",
+        "report_status": "Recommended",
+        "note": f"{source['label']} lifecycle data was not available.",
+    }
+    current = str(installed_version or "").strip()
+    if not current or current == "N/A":
+        result["note"] = f"The installed {source['label']} version was not available."
+        return result
+    try:
+        entries, _ = _get_product_eol_entries(product)
+    except RuntimeError as exc:
+        result["note"] = str(exc)
+        return result
+
+    current_normalised = _normalise_product_version(current, product)
+    match = next(
+        (
+            entry for entry in entries
+            if _normalise_product_version(entry.get("version", ""), product) == current_normalised
+        ),
+        None,
+    )
+    if not match:
+        result.update({
+            "lifecycle_status": "Unsupported / Unknown",
+            "report_status": "Critical",
+            "note": f"{source['label']} {current} was not found in the lifecycle data.",
+        })
+        return result
+
+    eom_dt = _parse_iso_date(match.get("eom", ""))
+    eos_dt = _parse_iso_date(match.get("eos", ""))
+    now = datetime.now(timezone.utc)
+    if eos_dt and now > eos_dt:
+        lifecycle = "Past End of Support Life"
+        report_status = "Critical"
+    elif eom_dt and now > eom_dt:
+        lifecycle = "Past End of Maintenance"
+        report_status = "Recommended"
+    else:
+        lifecycle = "Supported"
+        report_status = "Healthy"
+    result.update({
+        "matched_version": match.get("version") or "N/A",
+        "end_of_maintenance": eom_dt.date().isoformat() if eom_dt else "N/A",
+        "end_of_support_life": eos_dt.date().isoformat() if eos_dt else "N/A",
+        "lifecycle_status": lifecycle,
+        "report_status": report_status,
+        "note": "",
+    })
+    return result
 
 
 def _lookup_os_support(os_name: str, matrix: dict) -> dict:
@@ -240,7 +520,7 @@ def _lookup_os_support(os_name: str, matrix: dict) -> dict:
 
 
 def _load_aos_eol_info(path: str, aos_version: str) -> dict:
-    """Load lifecycle/EOL information for the current AOS version/train."""
+    """Load AOS lifecycle information from Nutanix, with a CSV fallback."""
     result = {
         "current_version": aos_version or "N/A",
         "matched_version": "N/A",
@@ -253,35 +533,8 @@ def _load_aos_eol_info(path: str, aos_version: str) -> dict:
         "report_status": "Recommended",
         "note": "AOS lifecycle data was not available.",
     }
-    if not path or not os.path.exists(path):
-        return result
     try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.reader(f))
-        header_idx = None
-        for i, row in enumerate(rows):
-            if row and row[0].strip() == "AOS Version":
-                header_idx = i
-                break
-        if header_idx is None:
-            return result
-        headers = [h.strip() for h in rows[header_idx]]
-        idx = {h: n for n, h in enumerate(headers)}
-        entries = []
-        for row in rows[header_idx + 1:]:
-            if not row or not row[0].strip():
-                continue
-            def get(col):
-                pos = idx.get(col)
-                return row[pos].strip() if pos is not None and pos < len(row) else ""
-            entries.append({
-                "version": get("AOS Version"),
-                "ga_date": get("GA Date"),
-                "eom": get("End of Maintenance"),
-                "eos": get("End of Support Life"),
-                "latest": get("Latest Version"),
-                "note": get("Note"),
-            })
+        entries, _ = _get_aos_eol_entries(path)
         current = str(aos_version or "").strip()
         current_minor = _aos_minor_version(current)
         exact = [e for e in entries if e["version"] == current]
@@ -341,8 +594,8 @@ def _load_aos_eol_info(path: str, aos_version: str) -> dict:
             "report_status": report_status,
             "note": match.get("note") or "",
         })
-    except Exception as exc:
-        print(f"    [WARN] Could not read AOS lifecycle matrix {path}: {exc}")
+    except RuntimeError as exc:
+        print(f"    [WARN] {exc}")
     return result
 
 
@@ -432,6 +685,7 @@ class PrismCentralClient:
             "Content-Type": "application/json",
             "Accept":       "application/json",
         })
+        self._domain_managers_cache = None
 
     # ── low-level helpers ────────────────────────────────────────────────
 
@@ -515,6 +769,26 @@ class PrismCentralClient:
                 continue
             clusters.append(c)
         return clusters
+
+    def list_domain_managers(self) -> Any:
+        """Return the read-only Prism Central domain-manager inventory."""
+        if self._domain_managers_cache is not None:
+            return self._domain_managers_cache
+        last_error = None
+        for ver in _v4_versions("prism"):
+            try:
+                response = self.get(
+                    f"/prism/{ver}/config/domain-managers",
+                    {"$limit": 20, "$select": "extId,config"},
+                )
+                if isinstance(response, dict):
+                    self._domain_managers_cache = response
+                    return response
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+        return None
 
     def detect_api_version(self, namespace: str = "clustermgmt") -> str:
         """
@@ -617,6 +891,7 @@ class ClusterDataCollector:
             ("virtual_machines",    self._virtual_machines),    # collect before ahv_version
             ("cvm_virtual_machines", self._cvm_virtual_machines), # optional PE CVM VM details
             ("ahv_version",         self._ahv_version),         # uses VM host UUIDs as fallback
+            ("domain_managers",     self.client.list_domain_managers), # PC version/build information
             ("lcm_entities",        self._lcm_entities),        # current software/firmware inventory
             ("alerts",              self._alerts),
             ("protection_policies", self._protection_policies),
@@ -2326,8 +2601,8 @@ class HealthAnalyser:
         self.raw          = raw
         self.customer     = customer
         self.cluster_name = cluster_name
-        self.os_compat_csv = _find_required_file("OS Compatibility Matrix CSV", OS_COMPAT_CSV_FILENAMES, os_compat_csv)
-        self.aos_eol_csv   = _find_required_file("AOS/NOS EOL information CSV", AOS_EOL_CSV_FILENAMES, aos_eol_csv)
+        self.os_compat_csv = _find_optional_file(OS_COMPAT_CSV_FILENAMES, os_compat_csv)
+        self.aos_eol_csv   = _find_optional_file(AOS_EOL_CSV_FILENAMES, aos_eol_csv)
 
     def _safe_list(self, key) -> list:
         v = self.raw.get(key)
@@ -5413,9 +5688,11 @@ class HealthAnalyser:
         requested_components = [
             ("AHV hypervisor", {"AHV", "AHV HYPERVISOR", "HYPERVISOR"}),
             ("AOS", {"AOS", "NOS"}),
+            ("Prism Central", {"PRISM CENTRAL", "PC"}),
             ("FSM", {"FSM", "FOUNDATION SERVICE MANAGER"}),
             ("Foundation", {"FOUNDATION"}),
             ("Foundation Platforms", {"FOUNDATION PLATFORMS", "FOUNDATION PLATFORM"}),
+            ("Nutanix Files", {"NUTANIX FILES", "FILES", "FILE SERVER"}),
             ("Licensing", {"LICENSING", "LICENSE"}),
             ("NCC", {"NCC"}),
             ("Security AOS", {"SECURITY AOS", "SECURITY AOS SERVICE"}),
@@ -5463,6 +5740,17 @@ class HealthAnalyser:
             )
             assign_version(label, entity.get("entityVersion"))
 
+        domain_managers = self._safe_list("domain_managers")
+        pc_versions = set()
+        for domain_manager in domain_managers:
+            config = domain_manager.get("config", {}) or {}
+            build_info = config.get("buildInfo", {}) or {}
+            pc_version = build_info.get("fullVersion") or build_info.get("version")
+            if pc_version:
+                pc_versions.add(str(pc_version).strip())
+        if pc_versions:
+            versions_by_component["Prism Central"] = pc_versions
+
         versions_by_component["AHV hypervisor"] = (
             set(observed_ahv_versions)
             if observed_ahv_versions
@@ -5498,6 +5786,31 @@ class HealthAnalyser:
                 "status": component_status,
             })
 
+        pc_version = (
+            sorted(versions_by_component["Prism Central"], key=_version_tuple)[0]
+            if len(versions_by_component["Prism Central"]) == 1
+            else "N/A"
+        )
+        files_version = (
+            sorted(versions_by_component["Nutanix Files"], key=_version_tuple)[0]
+            if len(versions_by_component["Nutanix Files"]) == 1
+            else "N/A"
+        )
+        pc_lifecycle = _load_product_eol_info("pc", pc_version)
+        files_lifecycle = _load_product_eol_info("files", files_version)
+
+        lifecycle_results = [aos_lifecycle]
+        if pc_version != "N/A":
+            lifecycle_results.append(pc_lifecycle)
+        if files_version != "N/A":
+            lifecycle_results.append(files_lifecycle)
+        if any(item.get("report_status") == self.STATUS_CRITICAL for item in lifecycle_results):
+            status = self.STATUS_CRITICAL
+        elif status != self.STATUS_CRITICAL and any(
+            item.get("report_status") == self.STATUS_RECOMMENDED for item in lifecycle_results
+        ):
+            status = self.STATUS_RECOMMENDED
+
         if any(item["status"] == self.STATUS_CRITICAL for item in software_inventory):
             status = self.STATUS_CRITICAL
         elif status != self.STATUS_CRITICAL and (
@@ -5522,6 +5835,20 @@ class HealthAnalyser:
             "Maintain AHV on a version qualified for the selected AOS release.",
             "Maintain NCC on a version supported by LCM.",
         ]
+        if pc_version != "N/A":
+            if pc_lifecycle["report_status"] == self.STATUS_CRITICAL:
+                recs.append("Upgrade Prism Central to a supported release as soon as possible.")
+            elif pc_lifecycle["report_status"] == self.STATUS_RECOMMENDED:
+                recs.append("Review Prism Central lifecycle status and plan an upgrade.")
+            else:
+                recs.append("Current Prism Central release is within its supported lifecycle window.")
+        if files_version != "N/A":
+            if files_lifecycle["report_status"] == self.STATUS_CRITICAL:
+                recs.append("Upgrade Nutanix Files to a supported release as soon as possible.")
+            elif files_lifecycle["report_status"] == self.STATUS_RECOMMENDED:
+                recs.append("Review Nutanix Files lifecycle status and plan an upgrade.")
+            else:
+                recs.append("Current Nutanix Files release is within its supported lifecycle window.")
         if not lcm_inventory_collected:
             recs.append(
                 "Review the LCM inventory status in Prism Central; this health check does not trigger inventory operations."
@@ -5531,8 +5858,12 @@ class HealthAnalyser:
             "aos_version": aos,
             "ahv_version": cluster_ahv,
             "ncc_version": ncc_version,
+            "pc_version": pc_version,
+            "files_version": files_version,
             "upgrade_status": upgrade_status.replace("_", " ").title(),
             "aos_lifecycle": aos_lifecycle,
+            "pc_lifecycle": pc_lifecycle,
+            "files_lifecycle": files_lifecycle,
             "software_inventory": software_inventory,
             "host_versions": sorted(host_versions, key=lambda row: str(row.get("host", "")).lower()),
             "ahv_consistent": ahv_consistent,
@@ -7451,6 +7782,14 @@ const children = [
     `• Current AHV Version: ${D.software_lifecycle.ahv_version || "N/A"}\n` +
     `• Current NCC Version: ${D.software_lifecycle.ncc_version || "N/A"}\n` +
     `• AOS Lifecycle Status: ${(D.software_lifecycle.aos_lifecycle || {}).lifecycle_status || "Unknown"}\n` +
+    ((D.software_lifecycle.pc_version && D.software_lifecycle.pc_version !== "N/A")
+      ? `• Current Prism Central Version: ${D.software_lifecycle.pc_version}\n` +
+        `• Prism Central Lifecycle Status: ${(D.software_lifecycle.pc_lifecycle || {}).lifecycle_status || "Unknown"}\n`
+      : "") +
+    ((D.software_lifecycle.files_version && D.software_lifecycle.files_version !== "N/A")
+      ? `• Current Nutanix Files Version: ${D.software_lifecycle.files_version}\n` +
+        `• Nutanix Files Lifecycle Status: ${(D.software_lifecycle.files_lifecycle || {}).lifecycle_status || "Unknown"}\n`
+      : "") +
     `• Last Cluster Upgrade: ${D.software_lifecycle.upgrade_status || "N/A"}\n` +
     (!D.software_lifecycle.ahv_consistent ? `• AHV Version Consistency: Inconsistent / Unknown` : ""),
     D.software_lifecycle.recommendations),
@@ -7481,7 +7820,7 @@ const doc = new Document({
     headers: { default: { options: { children: [new Table({
       layout: TableLayoutType.FIXED,
       width: { size: CONTENT_WIDTH, type: WidthType.DXA },
-      columnWidths: [2300, 6200, 2300],
+      columnWidths: [2300, 8500],
       rows: [new TableRow({ cantSplit: true, children: [
         new TableCell({
           width: { size: 2300, type: WidthType.DXA },
@@ -7504,22 +7843,7 @@ const doc = new Document({
           })],
         }),
         new TableCell({
-          width: { size: 6200, type: WidthType.DXA },
-          verticalAlign: VerticalAlign.CENTER,
-          margins: { top: 0, bottom: 40, left: 100, right: 100 },
-          borders: {
-            top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-            left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-            right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-            bottom: { style: BorderStyle.SINGLE, size: 6, color: NUTANIX_BLUE },
-          },
-          children: [new Paragraph({
-            spacing: { before: 0, after: 0 },
-            children: [new TextRun({ text: `Nutanix Health Check – ${C.cluster_name} – ${D.customer}`, font: REPORT_FONT, size: 16, color: HEADER_GREY })],
-          })],
-        }),
-        new TableCell({
-          width: { size: 2300, type: WidthType.DXA },
+          width: { size: 8500, type: WidthType.DXA },
           verticalAlign: VerticalAlign.CENTER,
           margins: { top: 0, bottom: 40, left: 100, right: 0 },
           borders: {
@@ -7531,7 +7855,7 @@ const doc = new Document({
           children: [new Paragraph({
             alignment: AlignmentType.RIGHT,
             spacing: { before: 0, after: 0 },
-            children: [new TextRun({ text: D.date, font: REPORT_FONT, size: TABLE_FONT_SIZE, color: HEADER_GREY })],
+            children: [new TextRun({ text: `Nutanix Health Check – ${C.cluster_name} – ${D.customer}`, font: REPORT_FONT, size: 16, color: HEADER_GREY })],
           })],
         }),
       ]})],
@@ -7761,13 +8085,14 @@ def generate_report(findings: dict, output_path: str) -> None:
         data_file = tf.name
 
     try:
+        report_logo_path, _ = _resolve_report_logo()
         env = os.environ.copy()
         # Also set NODE_PATH to the local node_modules as a belt-and-suspenders
         # fallback in case any edge-case lookup skips cwd resolution.
         env["NODE_PATH"] = _NODE_MODULES
 
         result = subprocess.run(
-            [_NODE_EXECUTABLE, _REPORT_JS, data_file, output_path, REPORT_LOGO_PATH],
+            [_NODE_EXECUTABLE, _REPORT_JS, data_file, output_path, report_logo_path],
             cwd=_RESOURCE_DIR,
             env=env,
             capture_output=True,
@@ -7873,13 +8198,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default=".", help="Directory for output files (default: current dir)")
     p.add_argument("--data-only", action="store_true", help="Save raw JSON only; skip report generation")
     p.add_argument("--from-json", help="Re-generate report from saved raw JSON (no cluster connection)")
-    p.add_argument("--os-compat-csv", default="", help="Path to OS Compatibility Matrix CSV (required for report generation if not in script/current folder)")
-    p.add_argument("--aos-eol-csv", default="", help="Path to NOS/AOS EOL information CSV (required for report generation if not in script/current folder)")
+    p.add_argument("--os-compat-csv", default="", help="Optional guest-OS compatibility CSV fallback path")
+    p.add_argument("--aos-eol-csv", default="", help="Optional AOS lifecycle CSV fallback path")
     return p.parse_args()
 
 
 def preflight_required_support_files(args: argparse.Namespace) -> None:
-    """Validate required CSV support files before prompting for Prism Central details."""
+    """Validate live support data, local fallbacks, and the report logo."""
     print()
     print("------------------------------------------------------------")
     print("Nutanix Health Check - Preflight Validation")
@@ -7902,45 +8227,60 @@ def preflight_required_support_files(args: argparse.Namespace) -> None:
         return
 
     print()
-    print("Checking required support files...")
+    print("Checking report support data...")
     print()
 
-    checks = [
-        ("OS Compatibility Matrix CSV", OS_COMPAT_CSV_FILENAMES, "os_compat_csv"),
-        ("AOS/NOS EOL information CSV", AOS_EOL_CSV_FILENAMES, "aos_eol_csv"),
-    ]
-
     missing = []
-    for label, filenames, attr in checks:
-        explicit_path = getattr(args, attr, "")
-        found = _find_optional_file(filenames, explicit_path)
-        if found:
-            setattr(args, attr, found)
-            print(f"  [OK] {os.path.basename(found)}")
-        else:
-            missing.append((label, filenames))
-            print(f"  [MISSING] {filenames[0]}")
+    args.os_compat_csv = _find_optional_file(OS_COMPAT_CSV_FILENAMES, args.os_compat_csv)
+    args.aos_eol_csv = _find_optional_file(AOS_EOL_CSV_FILENAMES, args.aos_eol_csv)
 
-    if os.path.isfile(REPORT_LOGO_PATH):
-        print(f"  [OK] {REPORT_LOGO_FILENAME}")
-    else:
+    try:
+        _, source = _get_os_compatibility_entries(args.os_compat_csv)
+        print(f"  [OK] Guest OS compatibility data ({source})")
+    except RuntimeError as exc:
+        missing.append(("Guest OS compatibility data", OS_COMPAT_CSV_FILENAMES))
+        print(f"  [MISSING] {exc}")
+
+    try:
+        _, source = _get_aos_eol_entries(args.aos_eol_csv)
+        print(f"  [OK] AOS lifecycle data ({source})")
+    except RuntimeError as exc:
+        missing.append(("AOS lifecycle data", AOS_EOL_CSV_FILENAMES))
+        print(f"  [MISSING] {exc}")
+
+    for product, label in (("pc", "Prism Central"), ("files", "Nutanix Files")):
+        try:
+            _, source = _get_product_eol_entries(product)
+            print(f"  [OK] {label} lifecycle data ({source})")
+        except RuntimeError as exc:
+            # These products have no packaged CSV fallback. Their lifecycle
+            # fields remain N/A if the public portal is temporarily unavailable.
+            print(f"  [WARNING] {exc}")
+
+    try:
+        _, logo_source = _resolve_report_logo()
+        if logo_source == "web":
+            print(f"  [OK] Report logo downloaded from {REPORT_LOGO_URL}")
+        else:
+            print(f"  [OK] {REPORT_LOGO_FILENAME} ({logo_source})")
+    except RuntimeError:
         missing.append(("Winslow Tech Group report logo", [REPORT_LOGO_FILENAME]))
-        print(f"  [MISSING] {REPORT_LOGO_FILENAME}")
+        print(f"  [MISSING] Report logo: {REPORT_LOGO_URL}")
 
     if missing:
         print()
         print("ERROR: Required report support files are missing.")
         print()
-        print("Place the missing CSV files under data/ and the report logo under images/, then run the health check again.")
+        print("Confirm internet access to the Nutanix Support Portal or place CSV fallbacks under data/. If the report logo cannot be downloaded, place its fallback under images/ and run the health check again.")
         print()
-        print("Expected files:")
+        print("Fallback files:")
         for _, filenames in missing:
             print(f"  - {filenames[0]}")
         print()
         sys.exit(1)
 
     print()
-    print("All required support files found.")
+    print("All report support data is available.")
     print("Proceeding to Prism Central connection...")
 
 
@@ -7949,7 +8289,7 @@ def main() -> None:
     run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     start_execution_log(args.output_dir, run_timestamp)
 
-    # Validate required CSV files before prompting for Prism Central details.
+    # Validate live support data and offline fallbacks before prompting.
     preflight_required_support_files(args)
 
     # ── offline mode: re-generate from saved JSON ────────────────────────

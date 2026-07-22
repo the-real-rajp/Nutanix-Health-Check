@@ -83,9 +83,11 @@ Node.js, npm packages, or CSV support files.
   data even when the repository is public.
 - Never store Prism credentials, passwords, tokens, or private certificates in
   source, documentation, logs, examples, commits, or release assets.
-- The required public support data belongs under `data/`:
+- The public AOS and guest-OS fallback data belongs under `data/`:
   - `OS_Compatibility_Matrix.csv`
   - `NOS_EOL_information_list.csv`
+- Current AOS, Prism Central, Nutanix Files, and guest-OS lifecycle or
+  compatibility data is retrieved from the official Nutanix Support Portal.
 
 ## Windows distribution
 
