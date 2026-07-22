@@ -2,7 +2,7 @@
 
 `nutanix_health_check.py` connects to Nutanix Prism Central, collects cluster inventory and health data through REST APIs, and generates a Microsoft Word health-check report for each registered cluster.
 
-Current release: **v1.0.0**
+Development version: **v1.1.0**
 
 ## Report coverage
 
@@ -23,8 +23,6 @@ The complete API-family and endpoint inventory is documented in
 
 ## Requirements
 
-### Python source distribution
-
 - Python 3.10 or later
 - Node.js 18 or later
 - Network access to Prism Central on port `9440`
@@ -41,26 +39,12 @@ first report run if that exact version is not already available. Pinning the
 package prevents an upstream release from unexpectedly changing report
 rendering. Matplotlib is used to generate the CPU, memory, and storage charts.
 
-### Windows portable distribution
-
-The Windows x64 release is self-contained and does not require Python,
-Node.js, npm, or the support CSV fallbacks to be installed separately. Download
-`Nutanix-Health-Check-1.0.0-Windows-x64.zip` from the GitHub release, extract
-the complete archive, and run `Run-Nutanix-Health-Check.cmd`. Reports, raw JSON
-captures, and logs are written beneath the extracted `output` directory.
-
-Keep `NutanixHealthCheck.exe`, `Run-Nutanix-Health-Check.cmd`, and the
-`_internal` directory together. The executable depends on the bundled runtime
-under `_internal`.
-
 ## Installation
-
-### Python source
 
 Clone the repository and create a virtual environment:
 
 ```bash
-git clone https://github.com/the-real-rajp/Nutanix-Health-Check.git
+git clone --branch develop/v1.1.0 --single-branch https://github.com/the-real-rajp/Nutanix-Health-Check.git
 cd Nutanix-Health-Check
 
 python3 -m venv .venv
@@ -68,26 +52,6 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
-
-### Building the Windows portable package
-
-On a Windows x64 build computer with Python, Node.js, npm, and PyInstaller
-available, activate the Python build environment and run:
-
-```powershell
-.\build-windows.ps1
-```
-
-The build script validates the application, bundles Node.js and the pinned
-`docx` package, runs PyInstaller, and creates:
-
-```text
-dist\Nutanix-Health-Check-1.0.0-Windows-x64.zip
-```
-
-Build products and downloaded runtimes under `build/`, `dist/`, and `vendor/`
-are intentionally excluded from Git. The tested ZIP is distributed as a
-GitHub release asset.
 
 ## Usage
 

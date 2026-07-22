@@ -8,14 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Windows x64 portable application packaging using PyInstaller.
-- Bundled Node.js runtime, pinned `docx` package, support CSV files, and chart dependencies.
-- Windows launcher that writes reports, raw JSON captures, and logs beneath an `output` directory.
+- Stable v4 API version registry and endpoint documentation.
+- Winslow Technology Group branding in generated Word reports.
+- Live Prism Central and Nutanix Files lifecycle data collection.
 
 ### Changed
 
-- Resource discovery now supports both the Python source tree and a frozen Windows application.
-- The generated JavaScript report builder is written to a writable temporary directory.
+- Executive status and alert-severity presentation is standardized.
+- Support lifecycle and guest-OS compatibility data is retrieved from the Nutanix Support Portal, with local fallbacks.
 
 ## 1.0.0 - 2026-07-16
 
