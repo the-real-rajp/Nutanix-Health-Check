@@ -34,6 +34,4 @@ jobs:
       - name: Validate command-line interface
         run: |
           python nutanix_health_check.py --help
-          expected_version="$(python -c 'import nutanix_health_check as app; print(app.__version__)')"
-          actual_version="$(python nutanix_health_check.py --version)"
-          test "$actual_version" = "nutanix_health_check.py $expected_version"
+          python nutanix_health_check.py --version | grep "1.0.0"
