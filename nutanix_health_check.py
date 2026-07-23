@@ -105,9 +105,8 @@ _NUTANIX_SUPPORT_DATA_CACHE = {}
 
 REPORT_LOGO_FILENAME = "winslow-technology-group-logo.png"
 REPORT_LOGO_URL = (
-    "https://raw.githubusercontent.com/the-real-rajp/"
-    "Nutanix-Health-Check/develop/v1.1.0/images/"
-    f"{REPORT_LOGO_FILENAME}"
+    "https://winslowtg.com/wp-content/uploads/2022/07/"
+    "logo-winslowtg@2x.png"
 )
 REPORT_LOGO_FALLBACK_PATH = _resource_path("images", REPORT_LOGO_FILENAME)
 _REPORT_LOGO_CACHE_PATH = ""
@@ -8260,7 +8259,7 @@ def preflight_required_support_files(args: argparse.Namespace) -> None:
     try:
         _, logo_source = _resolve_report_logo()
         if logo_source == "web":
-            print(f"  [OK] Report logo downloaded from {REPORT_LOGO_URL}")
+            print("  [OK] Report logo downloaded (WTG Website)")
         else:
             print(f"  [OK] {REPORT_LOGO_FILENAME} ({logo_source})")
     except RuntimeError:

@@ -32,7 +32,7 @@ The complete API-family and endpoint inventory is documented in
 - Optional offline CSV fallbacks in [`data/`](data/):
   - `OS_Compatibility_Matrix.csv`
   - `NOS_EOL_information_list.csv`
-- HTTPS access to the GitHub-hosted report logo; a bundled copy under `images/` is used automatically if the download is unavailable
+- HTTPS access to the official Winslow Technology Group website logo; a bundled copy under `images/` is used automatically if the download is unavailable
 
 The script installs the pinned Node.js `docx` package (`9.7.1`) locally on its
 first report run if that exact version is not already available. Pinning the
@@ -87,7 +87,7 @@ Checking report support data...
   [OK] AOS lifecycle data (Nutanix Support Portal)
   [OK] Prism Central lifecycle data (Nutanix Support Portal)
   [OK] Nutanix Files lifecycle data (Nutanix Support Portal)
-  [OK] Report logo downloaded from https://raw.githubusercontent.com/...
+  [OK] Report logo downloaded (WTG Website)
 
 All report support data is available.
 Proceeding to Prism Central connection...
@@ -137,7 +137,7 @@ python nutanix_health_check.py \
 The script retrieves AOS, Prism Central, and Nutanix Files lifecycle data and
 guest-OS compatibility data from the official Nutanix Support Portal APIs. It automatically searches the project
 root and `data/` for offline CSV fallbacks. During report generation it
-downloads the report logo from GitHub and embeds it in the DOCX; the completed
+downloads the report logo from the Winslow Technology Group website and embeds it in the DOCX; the completed
 report does not depend on the URL when opened. If the download fails, the
 script uses the copy under `images/` or the bundled Windows resources. Custom
 fallback CSV paths can be supplied with:
